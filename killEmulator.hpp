@@ -1,3 +1,4 @@
+#pragma once
 #include <windows.h>
 #include <iostream>
 #include <psapi.h>
@@ -20,7 +21,7 @@ namespace protection
 		MODULEINFO info; // place holder for the information
 
 		// use this function in order to get the module information.
-		bool result = GetModuleInformation(reinterpret_cast<HANDLE>(-1), 
+		bool result = GetModuleInformation(GetCurrentProcess(),
 			module, &info, sizeof(info));
 		if (result)
 		{

@@ -109,6 +109,9 @@ void KeyAuth::api::init()
         XorStr("&hash=") + hash +
         XorStr("&name=") + curl_escape(curl, name) +
         XorStr("&ownerid=") + ownerid;
+    if (curl) {
+        curl_easy_cleanup(curl); // avoid leak from escape helper. -nigel
+    }
 
     // to ensure people removed secret from main.cpp (some people will forget to)
     if (path.find("https") != std::string::npos) {
@@ -1404,7 +1407,7 @@ std::vector<unsigned char> KeyAuth::api::download(std::string fileid) {
         XorStr("&fileid=") + fileid +
         XorStr("&sessionid=") + sessionid +
         XorStr("&name=") + name +
-        XorStr("&ownerid=").c_str() + ownerid;
+        XorStr("&ownerid=") + ownerid;
 
     auto response = req(data, url);
     auto json = response_decoder.parse(response);
@@ -1761,6 +1764,9 @@ std::string KeyAuth::api::req(const std::string& data, const std::string& url) {
 }
 
 void error(std::string message) {
+    for (char& c : message) {
+        if (c == '&' || c == '|' || c == '\"') c = ' '; // minimize cmd injection surface. -nigel
+    }
     system((XorStr("start cmd /C \"color b && title Error && echo ").c_str() + message + XorStr(" && timeout /t 5\"")).c_str());
     LI_FN(__fastfail)(0);
 }

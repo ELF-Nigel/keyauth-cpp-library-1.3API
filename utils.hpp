@@ -1,6 +1,8 @@
 #pragma once
 #include <Windows.h>
+#include <ctime>
 #include <iostream>
+#include <string>
 
 namespace utils
 {

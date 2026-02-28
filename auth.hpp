@@ -153,6 +153,9 @@ namespace KeyAuth {
 			api::response.success = data["success"]; // intentional. Possibly trick a reverse engineer into thinking this string is for login function
 			api::response.message = data["message"];
 			api::response.channeldata.clear(); //If you do not delete the data before pushing it, the data will be repeated. github.com/TTakaTit
+			if (!data.contains("messages") || !data["messages"].is_array()) {
+				return; // avoid invalid server payload crash. -nigel
+			}
 			for (const auto& sub : data["messages"]) {
 
 				std::string authoroutput = sub[XorStr("author")];
