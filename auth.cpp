@@ -38,6 +38,7 @@
 #include <cstdio>
 #include <iostream>
 #include <memory>
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <array>
@@ -78,6 +79,7 @@ void integrity_check();
 void integrity_watchdog();
 std::string extract_host(const std::string& url);
 bool hosts_override_present(const std::string& host);
+bool module_paths_ok();
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
@@ -88,6 +90,7 @@ bool KeyAuth::api::debug = false;
 std::atomic<bool> LoggedIn(false);
 std::atomic<long long> last_integrity_check{ 0 };
 std::atomic<int> integrity_fail_streak{ 0 };
+std::atomic<long long> last_module_check{ 0 };
 
 void KeyAuth::api::init()
 {
@@ -1628,10 +1631,11 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     long long current_unix_time = std::chrono::duration_cast<std::chrono::seconds>(
         current_time.time_since_epoch()).count();
 
-    if (current_unix_time - unix_timestamp > 20) {
-        std::cerr << "[ERROR] Timestamp too old (diff = "
-            << (current_unix_time - unix_timestamp) << "s)\n";
-        MessageBoxA(0, "Signature verification failed (timestamp too old)", "KeyAuth", MB_ICONERROR);
+    const long long diff = std::llabs(current_unix_time - unix_timestamp);
+    if (diff > 120) {
+        std::cerr << "[ERROR] Timestamp too skewed (diff = "
+            << diff << "s)\n";
+        MessageBoxA(0, "Signature verification failed (timestamp skew)", "KeyAuth", MB_ICONERROR);
         exit(3);
     }
 
@@ -1760,6 +1764,35 @@ bool hosts_override_present(const std::string& host)
             return true;
     }
     return false;
+}
+
+static std::wstring to_lower_ws(std::wstring value)
+{
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+    return value;
+}
+
+bool module_paths_ok()
+{
+    const wchar_t* kModules[] = { L"ntdll.dll", L"kernel32.dll", L"kernelbase.dll", L"user32.dll" };
+    const wchar_t* sysroot_env = _wgetenv(L"SystemRoot");
+    std::wstring sysroot = sysroot_env ? sysroot_env : L"C:\\Windows";
+    std::wstring sys32 = to_lower_ws(sysroot + L"\\System32\\");
+    std::wstring syswow = to_lower_ws(sysroot + L"\\SysWOW64\\");
+
+    for (const auto* name : kModules) {
+        HMODULE mod = GetModuleHandleW(name);
+        if (!mod)
+            continue;
+        wchar_t path[MAX_PATH] = {};
+        if (!GetModuleFileNameW(mod, path, MAX_PATH))
+            return false;
+        std::wstring p = to_lower_ws(path);
+        if (p.rfind(sys32, 0) != 0 && p.rfind(syswow, 0) != 0)
+            return false;
+    }
+    return true;
 }
 
 void KeyAuth::api::setDebug(bool value) {
@@ -2143,6 +2176,15 @@ void checkInit() {
     if (!initialized) {
         error(XorStr("You need to run the KeyAuthApp.init(); function before any other KeyAuth functions"));
     }
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto last_mod = last_module_check.load();
+    if (now - last_mod > 60) {
+        last_module_check.store(now);
+        if (!module_paths_ok()) {
+            error(XorStr("module path check failed, possible side-load detected."));
+        }
+    }
     integrity_check();
 }
 
@@ -2166,6 +2208,15 @@ void integrity_watchdog() {
         Sleep(static_cast<DWORD>(sleep_seconds(gen) * 1000));
         if (!initialized || !LoggedIn.load())
             continue;
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const auto last_mod = last_module_check.load();
+        if (now - last_mod > 120) {
+            last_module_check.store(now);
+            if (!module_paths_ok()) {
+                error(XorStr("module path check failed, possible side-load detected."));
+            }
+        }
         if (check_section_integrity(XorStr(".text").c_str(), false)) {
             const int streak = integrity_fail_streak.fetch_add(1) + 1;
             if (streak >= 2) {
