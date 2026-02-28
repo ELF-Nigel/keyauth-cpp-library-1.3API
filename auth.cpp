@@ -72,6 +72,7 @@ void checkFiles();
 void checkRegistry();
 void error(std::string message);
 std::string generate_random_number();
+std::string curl_escape(CURL* curl, const std::string& input);
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
@@ -100,7 +101,7 @@ void KeyAuth::api::init()
         XorStr("type=init") +
         XorStr("&ver=") + version +
         XorStr("&hash=") + hash +
-        XorStr("&name=") + curl_easy_escape(curl, name.c_str(), 0) +
+        XorStr("&name=") + curl_escape(curl, name) +
         XorStr("&ownerid=") + ownerid;
 
     // to ensure people removed secret from main.cpp (some people will forget to)
@@ -1421,8 +1422,8 @@ std::string KeyAuth::api::webhook(std::string id, std::string params, std::strin
     auto data =
         XorStr("type=webhook") +
         XorStr("&webid=") + id +
-        XorStr("&params=") + curl_easy_escape(curl, params.c_str(), 0) +
-        XorStr("&body=") + curl_easy_escape(curl, body.c_str(), 0) +
+        XorStr("&params=") + curl_escape(curl, params) +
+        XorStr("&body=") + curl_escape(curl, body) +
         XorStr("&conttype=") + contenttype +
         XorStr("&sessionid=") + sessionid +
         XorStr("&name=") + name +
@@ -1601,7 +1602,15 @@ void KeyAuth::api::logout() {
 
 int VerifyPayload(std::string signature, std::string timestamp, std::string body)
 {
-    long long unix_timestamp = std::stoll(timestamp);
+    long long unix_timestamp = 0;
+    try {
+        unix_timestamp = std::stoll(timestamp);
+    }
+    catch (...) {
+        std::cerr << "[ERROR] Invalid timestamp format\n";
+        MessageBoxA(0, "Signature verification failed (invalid timestamp)", "KeyAuth", MB_ICONERROR);
+        exit(2);
+    }
 
     auto current_time = std::chrono::system_clock::now();
     long long current_unix_time = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1678,12 +1687,28 @@ std::string get_str_between_two_str(const std::string& s,
     const std::string& start_delim,
     const std::string& stop_delim)
 {
-    unsigned first_delim_pos = s.find(start_delim);
-    unsigned end_pos_of_first_delim = first_delim_pos + start_delim.length();
-    unsigned last_delim_pos = s.find(stop_delim);
+    const auto first_delim_pos = s.find(start_delim);
+    if (first_delim_pos == std::string::npos)
+        return {};
+    const auto end_pos_of_first_delim = first_delim_pos + start_delim.length();
+    const auto last_delim_pos = s.find(stop_delim, end_pos_of_first_delim);
+    if (last_delim_pos == std::string::npos || last_delim_pos < end_pos_of_first_delim)
+        return {};
 
     return s.substr(end_pos_of_first_delim,
         last_delim_pos - end_pos_of_first_delim);
+}
+
+std::string curl_escape(CURL* curl, const std::string& input)
+{
+    if (!curl)
+        return input;
+    char* escaped = curl_easy_escape(curl, input.c_str(), 0);
+    if (!escaped)
+        return {};
+    std::string out(escaped);
+    curl_free(escaped);
+    return out;
 }
 
 void KeyAuth::api::setDebug(bool value) {

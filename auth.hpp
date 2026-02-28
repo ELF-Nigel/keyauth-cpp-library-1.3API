@@ -124,7 +124,7 @@ namespace KeyAuth {
 			api::user_data.createdate = data[XorStr("createdate")];
 			api::user_data.lastlogin = data[XorStr("lastlogin")];
 
-			for (int i = 0; i < data[XorStr("subscriptions")].size(); i++) { // Prompto#7895 & stars#2297 was here
+			for (size_t i = 0; i < data[XorStr("subscriptions")].size(); i++) { // Prompto#7895 & stars#2297 was here
 				subscriptions_class subscriptions;
 				subscriptions.name = data[XorStr("subscriptions")][i][XorStr("subscription")];
 				subscriptions.expiry = data[XorStr("subscriptions")][i][XorStr("expiry")];
@@ -153,7 +153,7 @@ namespace KeyAuth {
 			api::response.success = data["success"]; // intentional. Possibly trick a reverse engineer into thinking this string is for login function
 			api::response.message = data["message"];
 			api::response.channeldata.clear(); //If you do not delete the data before pushing it, the data will be repeated. github.com/TTakaTit
-			for (const auto sub : data["messages"]) {
+			for (const auto& sub : data["messages"]) {
 
 				std::string authoroutput = sub[XorStr("author")];
 				std::string messageoutput = sub["message"];
