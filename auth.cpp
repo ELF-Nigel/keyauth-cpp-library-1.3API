@@ -73,6 +73,7 @@ void checkRegistry();
 void error(std::string message);
 std::string generate_random_number();
 std::string curl_escape(CURL* curl, const std::string& input);
+auto check_section_integrity( const char *section_name, bool fix ) -> bool;
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
@@ -81,6 +82,7 @@ bool initialized;
 std::string API_PUBLIC_KEY = "5586b4bc69c7a4b487e4563a4cd96afd39140f919bd31cea7d1c6a1e8439422b";
 bool KeyAuth::api::debug = false;
 std::atomic<bool> LoggedIn(false);
+std::atomic<long long> last_integrity_check{ 0 };
 
 void KeyAuth::api::init()
 {
@@ -2083,6 +2085,15 @@ void KeyAuth::api::debugInfo(std::string data, std::string url, std::string resp
 void checkInit() {
     if (!initialized) {
         error(XorStr("You need to run the KeyAuthApp.init(); function before any other KeyAuth functions"));
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto last = last_integrity_check.load();
+    if (now - last > 30) {
+        last_integrity_check.store(now);
+        if (check_section_integrity(XorStr(".text").c_str(), false)) {
+            error(XorStr("check_section_integrity() failed, don't tamper with the program."));
+        }
     }
 }
 // code submitted in pull request from https://github.com/BINM7MD
