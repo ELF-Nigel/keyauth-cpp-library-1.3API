@@ -76,6 +76,8 @@ std::string curl_escape(CURL* curl, const std::string& input);
 auto check_section_integrity( const char *section_name, bool fix ) -> bool;
 void integrity_check();
 void integrity_watchdog();
+std::string extract_host(const std::string& url);
+bool hosts_override_present(const std::string& host);
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
@@ -1721,6 +1723,45 @@ std::string curl_escape(CURL* curl, const std::string& input)
     return out;
 }
 
+std::string extract_host(const std::string& url)
+{
+    std::string host = url;
+    const auto scheme_pos = host.find("://");
+    if (scheme_pos != std::string::npos)
+        host = host.substr(scheme_pos + 3);
+    const auto slash_pos = host.find('/');
+    if (slash_pos != std::string::npos)
+        host = host.substr(0, slash_pos);
+    const auto colon_pos = host.find(':');
+    if (colon_pos != std::string::npos)
+        host = host.substr(0, colon_pos);
+    return host;
+}
+
+bool hosts_override_present(const std::string& host)
+{
+    if (host.empty())
+        return false;
+    const char* sysroot = std::getenv("SystemRoot");
+    std::string hosts_path = sysroot ? std::string(sysroot) : "C:\\Windows";
+    hosts_path += "\\System32\\drivers\\etc\\hosts";
+    std::ifstream file(hosts_path);
+    if (!file.good())
+        return false;
+    std::string line;
+    while (std::getline(file, line)) {
+        auto hash_pos = line.find('#');
+        if (hash_pos != std::string::npos)
+            line = line.substr(0, hash_pos);
+        if (line.find(host) == std::string::npos)
+            continue;
+        // basic whole-word check
+        if (line.find(" " + host) != std::string::npos || line.find("\t" + host) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
 void KeyAuth::api::setDebug(bool value) {
     KeyAuth::api::debug = value;
 }
@@ -1729,6 +1770,10 @@ std::string KeyAuth::api::req(const std::string& data, const std::string& url) {
     signature.clear();
     signatureTimestamp.clear();
     integrity_check();
+    const auto host = extract_host(url);
+    if (hosts_override_present(host)) {
+        error(XorStr("Hosts file override detected for API host."));
+    }
 
     CURL* curl = curl_easy_init();
     if (!curl) {
