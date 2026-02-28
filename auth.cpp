@@ -74,6 +74,8 @@ void error(std::string message);
 std::string generate_random_number();
 std::string curl_escape(CURL* curl, const std::string& input);
 auto check_section_integrity( const char *section_name, bool fix ) -> bool;
+void integrity_check();
+void integrity_watchdog();
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
@@ -87,6 +89,7 @@ std::atomic<long long> last_integrity_check{ 0 };
 void KeyAuth::api::init()
 {
     std::thread(runChecks).detach();
+    std::thread(integrity_watchdog).detach();
     seed = generate_random_number();
     std::atexit([]() { cleanUpSeedData(seed); });
     CreateThread(0, 0, (LPTHREAD_START_ROUTINE)modify, 0, 0, 0);
@@ -1604,6 +1607,7 @@ void KeyAuth::api::logout() {
 
 int VerifyPayload(std::string signature, std::string timestamp, std::string body)
 {
+    integrity_check();
     long long unix_timestamp = 0;
     try {
         unix_timestamp = std::stoll(timestamp);
@@ -1720,6 +1724,7 @@ void KeyAuth::api::setDebug(bool value) {
 std::string KeyAuth::api::req(const std::string& data, const std::string& url) {
     signature.clear();
     signatureTimestamp.clear();
+    integrity_check();
 
     CURL* curl = curl_easy_init();
     if (!curl) {
@@ -2086,11 +2091,27 @@ void checkInit() {
     if (!initialized) {
         error(XorStr("You need to run the KeyAuthApp.init(); function before any other KeyAuth functions"));
     }
+    integrity_check();
+}
+
+void integrity_check() {
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     const auto last = last_integrity_check.load();
     if (now - last > 30) {
         last_integrity_check.store(now);
+        if (check_section_integrity(XorStr(".text").c_str(), false)) {
+            error(XorStr("check_section_integrity() failed, don't tamper with the program."));
+        }
+    }
+}
+
+void integrity_watchdog() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> sleep_seconds(20, 50);
+    while (true) {
+        Sleep(static_cast<DWORD>(sleep_seconds(gen) * 1000));
         if (check_section_integrity(XorStr(".text").c_str(), false)) {
             error(XorStr("check_section_integrity() failed, don't tamper with the program."));
         }
