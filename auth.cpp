@@ -85,6 +85,7 @@ std::string API_PUBLIC_KEY = "5586b4bc69c7a4b487e4563a4cd96afd39140f919bd31cea7d
 bool KeyAuth::api::debug = false;
 std::atomic<bool> LoggedIn(false);
 std::atomic<long long> last_integrity_check{ 0 };
+std::atomic<int> integrity_fail_streak{ 0 };
 
 void KeyAuth::api::init()
 {
@@ -2112,8 +2113,15 @@ void integrity_watchdog() {
     std::uniform_int_distribution<int> sleep_seconds(20, 50);
     while (true) {
         Sleep(static_cast<DWORD>(sleep_seconds(gen) * 1000));
+        if (!initialized || !LoggedIn.load())
+            continue;
         if (check_section_integrity(XorStr(".text").c_str(), false)) {
-            error(XorStr("check_section_integrity() failed, don't tamper with the program."));
+            const int streak = integrity_fail_streak.fetch_add(1) + 1;
+            if (streak >= 2) {
+                error(XorStr("check_section_integrity() failed, don't tamper with the program."));
+            }
+        } else {
+            integrity_fail_streak.store(0);
         }
     }
 }
