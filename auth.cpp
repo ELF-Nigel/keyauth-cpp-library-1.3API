@@ -1666,9 +1666,9 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     if (!prologues_ok()) {
         error(XorStr("function prologue check failed, possible inline hook detected."));
     }
-    // if (!iat_virtualprotect_ok()) {
-    //     error(XorStr("VirtualProtect IAT check failed."));
-    // }
+    if (!iat_virtualprotect_ok()) {
+        error(XorStr("VirtualProtect IAT check failed."));
+    }
     if (!import_addresses_ok()) {
         error(XorStr("import address check failed."));
     }
@@ -2325,7 +2325,7 @@ bool import_addresses_ok()
     return true;
 }
 
-static bool iat_resolves_to(HMODULE module, const char* import_name, const void* target, bool& found)
+static bool iat_get_import_address(HMODULE module, const char* import_name, void*& out_addr, bool& found)
 {
     if (!module)
         return true;
@@ -2354,7 +2354,8 @@ static bool iat_resolves_to(HMODULE module, const char* import_name, const void*
             auto import = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + orig->u1.AddressOfData);
             if (strcmp(reinterpret_cast<char*>(import->Name), import_name) == 0) {
                 found = true;
-                return reinterpret_cast<const void*>(thunk->u1.Function) == target;
+                out_addr = reinterpret_cast<void*>(thunk->u1.Function);
+                return true;
             }
         }
     }
@@ -2368,15 +2369,15 @@ bool iat_virtualprotect_ok()
     if (!vp)
         vp = GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "VirtualProtect");
     if (!vp)
-        return false;
-    if (!addr_in_module(reinterpret_cast<const void*>(vp), L"kernelbase.dll") &&
-        !addr_in_module(reinterpret_cast<const void*>(vp), L"kernel32.dll"))
-        return false;
+        return true;
     bool found = false;
-    const bool match = iat_resolves_to(self, "VirtualProtect", reinterpret_cast<const void*>(vp), found);
-    if (!found)
+    void* iat_addr = nullptr;
+    const bool ok = iat_get_import_address(self, "VirtualProtect", iat_addr, found);
+    if (!ok || !found)
         return true; // allow when not imported
-    return match;
+    if (addr_in_module(iat_addr, L"kernelbase.dll") || addr_in_module(iat_addr, L"kernel32.dll"))
+        return true;
+    return false;
 }
 
 bool module_allowlist_ok()
@@ -2451,9 +2452,9 @@ std::string KeyAuth::api::req(const std::string& data, const std::string& url) {
         !func_region_ok(reinterpret_cast<const void*>(&check_section_integrity))) {
         error(XorStr("function region check failed, possible hook detected."));
     }
-    // if (!iat_virtualprotect_ok()) {
-    //     error(XorStr("VirtualProtect IAT check failed."));
-    // }
+    if (!iat_virtualprotect_ok()) {
+        error(XorStr("VirtualProtect IAT check failed."));
+    }
     if (!import_addresses_ok()) {
         error(XorStr("import address check failed."));
     }
@@ -2859,9 +2860,9 @@ void checkInit() {
         if (timing_anomaly_detected()) {
             error(XorStr("timing anomaly detected, possible time tamper."));
         }
-        // if (!iat_virtualprotect_ok()) {
-        //     error(XorStr("VirtualProtect IAT check failed."));
-        // }
+        if (!iat_virtualprotect_ok()) {
+            error(XorStr("VirtualProtect IAT check failed."));
+        }
         if (!text_hashes_ok()) {
             error(XorStr("text section hash check failed."));
         }
