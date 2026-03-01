@@ -48,6 +48,7 @@
 #include <intrin.h>
 #include <array>
 #include <cstring>
+#include <vector>
 #include <stdexcept>
 #include <string>
 #include <array>
@@ -99,6 +100,10 @@ bool func_region_ok(const void* addr);
 bool timing_anomaly_detected();
 void start_heartbeat(KeyAuth::api* instance);
 void heartbeat_thread(KeyAuth::api* instance);
+void snapshot_text_hashes();
+bool text_hashes_ok();
+bool detour_suspect(const uint8_t* p);
+bool import_addresses_ok();
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
@@ -119,6 +124,9 @@ std::array<uint8_t, 16> pro_checkinit{};
 std::array<uint8_t, 16> pro_error{};
 std::array<uint8_t, 16> pro_integrity{};
 std::array<uint8_t, 16> pro_section{};
+std::atomic<bool> text_hashes_ready{ false };
+struct TextHash { size_t offset; size_t len; uint32_t hash; };
+std::vector<TextHash> text_hashes;
 
 void KeyAuth::api::init()
 {
@@ -1647,6 +1655,18 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     if (!prologues_ok()) {
         error(XorStr("function prologue check failed, possible inline hook detected."));
     }
+    if (!import_addresses_ok()) {
+        error(XorStr("import address check failed."));
+    }
+    if (!text_hashes_ok()) {
+        error(XorStr("text section hash check failed."));
+    }
+    if (detour_suspect(reinterpret_cast<const uint8_t*>(&KeyAuth::api::req)) ||
+        detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) ||
+        detour_suspect(reinterpret_cast<const uint8_t*>(&checkInit)) ||
+        detour_suspect(reinterpret_cast<const uint8_t*>(&error))) {
+        error(XorStr("detour pattern detected."));
+    }
     integrity_check();
     long long unix_timestamp = 0;
     try {
@@ -2025,6 +2045,7 @@ void snapshot_prologues()
     std::memcpy(pro_integrity.data(), integ_ptr, pro_integrity.size());
     std::memcpy(pro_section.data(), section_ptr, pro_section.size());
     prologues_ready.store(true);
+    snapshot_text_hashes();
 }
 
 bool prologues_ok()
@@ -2077,6 +2098,118 @@ bool timing_anomaly_detected()
     return false;
 }
 
+static bool get_text_section_info(std::uintptr_t& base, size_t& size)
+{
+    const auto hmodule = GetModuleHandle(nullptr);
+    if (!hmodule) return false;
+    const auto base_0 = reinterpret_cast<std::uintptr_t>(hmodule);
+    const auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base_0);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    const auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base_0 + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    auto section = IMAGE_FIRST_SECTION(nt);
+    for (auto i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (std::memcmp(section->Name, ".text", 5) == 0) {
+            base = base_0 + section->VirtualAddress;
+            size = section->Misc.VirtualSize;
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint32_t fnv1a(const uint8_t* data, size_t len)
+{
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= data[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+void snapshot_text_hashes()
+{
+    if (text_hashes_ready.load())
+        return;
+    std::uintptr_t base = 0;
+    size_t size = 0;
+    if (!get_text_section_info(base, size) || size < 256)
+        return;
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<size_t> dist(0, size - 64);
+    text_hashes.clear();
+    for (int i = 0; i < 8; ++i) {
+        const size_t offset = dist(gen);
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(base + offset);
+        text_hashes.push_back({ offset, 64, fnv1a(ptr, 64) });
+    }
+    text_hashes_ready.store(true);
+}
+
+bool text_hashes_ok()
+{
+    if (!text_hashes_ready.load())
+        return true;
+    std::uintptr_t base = 0;
+    size_t size = 0;
+    if (!get_text_section_info(base, size))
+        return true;
+    for (const auto& h : text_hashes) {
+        if (h.offset + h.len > size)
+            return false;
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(base + h.offset);
+        if (fnv1a(ptr, h.len) != h.hash)
+            return false;
+    }
+    return true;
+}
+
+bool detour_suspect(const uint8_t* p)
+{
+    if (!p)
+        return true;
+    // jmp rel32 / call rel32 / jmp rel8
+    if (p[0] == 0xE9 || p[0] == 0xE8 || p[0] == 0xEB)
+        return true;
+    // jmp/call [rip+imm32]
+    if (p[0] == 0xFF && (p[1] == 0x25 || p[1] == 0x15))
+        return true;
+    // mov rax, imm64; jmp rax
+    if (p[0] == 0x48 && p[1] == 0xB8 && p[10] == 0xFF && p[11] == 0xE0)
+        return true;
+    return false;
+}
+
+static bool addr_in_module(const void* addr, const wchar_t* module_name)
+{
+    HMODULE mod = module_name ? GetModuleHandleW(module_name) : GetModuleHandle(nullptr);
+    if (!mod)
+        return false;
+    MODULEINFO mi{};
+    if (!GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi)))
+        return false;
+    const auto base = reinterpret_cast<const uint8_t*>(mi.lpBaseOfDll);
+    const auto end = base + mi.SizeOfImage;
+    return addr >= base && addr < end;
+}
+
+bool import_addresses_ok()
+{
+    // wintrust functions should resolve inside wintrust.dll
+    if (!addr_in_module(reinterpret_cast<const void*>(&WinVerifyTrust), L"wintrust.dll"))
+        return false;
+    // VirtualQuery should be inside kernelbase/kernel32
+    if (!addr_in_module(reinterpret_cast<const void*>(&VirtualQuery), L"kernelbase.dll") &&
+        !addr_in_module(reinterpret_cast<const void*>(&VirtualQuery), L"kernel32.dll"))
+        return false;
+    // curl functions should live in main module when statically linked
+    if (!addr_in_module(reinterpret_cast<const void*>(&curl_easy_perform), nullptr))
+        return false;
+    return true;
+}
+
 void heartbeat_thread(KeyAuth::api* instance)
 {
     std::random_device rd;
@@ -2118,6 +2251,18 @@ std::string KeyAuth::api::req(const std::string& data, const std::string& url) {
         !func_region_ok(reinterpret_cast<const void*>(&integrity_check)) ||
         !func_region_ok(reinterpret_cast<const void*>(&check_section_integrity))) {
         error(XorStr("function region check failed, possible hook detected."));
+    }
+    if (!import_addresses_ok()) {
+        error(XorStr("import address check failed."));
+    }
+    if (!text_hashes_ok()) {
+        error(XorStr("text section hash check failed."));
+    }
+    if (detour_suspect(reinterpret_cast<const uint8_t*>(&KeyAuth::api::req)) ||
+        detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) ||
+        detour_suspect(reinterpret_cast<const uint8_t*>(&checkInit)) ||
+        detour_suspect(reinterpret_cast<const uint8_t*>(&error))) {
+        error(XorStr("detour pattern detected."));
     }
     const auto host = extract_host(url);
     if (hosts_override_present(host)) {
@@ -2506,6 +2651,18 @@ void checkInit() {
         last_periodic_check.store(now);
         if (timing_anomaly_detected()) {
             error(XorStr("timing anomaly detected, possible time tamper."));
+        }
+        if (!text_hashes_ok()) {
+            error(XorStr("text section hash check failed."));
+        }
+        if (!import_addresses_ok()) {
+            error(XorStr("import address check failed."));
+        }
+        if (detour_suspect(reinterpret_cast<const uint8_t*>(&KeyAuth::api::req)) ||
+            detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) ||
+            detour_suspect(reinterpret_cast<const uint8_t*>(&checkInit)) ||
+            detour_suspect(reinterpret_cast<const uint8_t*>(&error))) {
+            error(XorStr("detour pattern detected."));
         }
         if (!prologues_ok()) {
             error(XorStr("function prologue check failed, possible inline hook detected."));
