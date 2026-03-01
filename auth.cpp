@@ -184,6 +184,7 @@ void KeyAuth::api::init()
         XorStr("&ownerid=") + ownerid;
     if (curl) {
         curl_easy_cleanup(curl); // avoid leak from escape helper. -nigel
+        curl = nullptr;
     }
 
     // to ensure people removed secret from main.cpp (some people will forget to)
@@ -225,7 +226,7 @@ void KeyAuth::api::init()
         data += XorStr("&token=").c_str() + token;
         data += XorStr("&thash=").c_str() + path;
     }
-    curl_easy_cleanup(curl);
+    // curl was only used for escape above
 
     auto response = req(data, url);
 
