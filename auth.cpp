@@ -409,8 +409,6 @@ void KeyAuth::api::login(std::string username, std::string password, std::string
                 LI_FN(GlobalAddAtomA)(ownerid.c_str());
 		LoggedIn.store(true);
 		start_heartbeat(this);
-		start_heartbeat(this);
-		start_heartbeat(this);
             }
             else {
                 LI_FN(exit)(12);
