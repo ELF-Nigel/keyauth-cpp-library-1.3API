@@ -113,6 +113,9 @@ void snapshot_pe_header();
 bool pe_header_ok();
 bool iat_virtualprotect_ok();
 bool module_allowlist_ok();
+void snapshot_module_baseline();
+bool new_modules_present();
+bool text_guard_pages_present();
 static void secure_zero(std::string& value);
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
@@ -141,6 +144,8 @@ std::vector<std::pair<std::uintptr_t, DWORD>> text_protections;
 std::atomic<bool> pe_header_ready{ false };
 uint32_t pe_header_hash = 0;
 std::atomic<int> heavy_fail_streak{ 0 };
+std::atomic<bool> module_baseline_ready{ false };
+std::vector<std::wstring> module_baseline;
 
 void KeyAuth::api::init()
 {
@@ -2110,6 +2115,7 @@ void snapshot_prologues()
     snapshot_text_hashes();
     snapshot_text_page_protections();
     snapshot_pe_header();
+    snapshot_module_baseline();
 }
 
 bool prologues_ok()
@@ -2266,6 +2272,62 @@ bool text_page_protections_ok()
     return true;
 }
 
+bool text_guard_pages_present()
+{
+    std::uintptr_t base = 0;
+    size_t size = 0;
+    if (!get_text_section_info(base, size))
+        return false;
+    const size_t page = 0x1000;
+    for (size_t off = 0; off < size; off += page) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<const void*>(base + off), &mbi, sizeof(mbi)) == 0)
+            continue;
+        if (mbi.Protect & PAGE_GUARD)
+            return true;
+    }
+    return false;
+}
+
+void snapshot_module_baseline()
+{
+    if (module_baseline_ready.load())
+        return;
+    HMODULE mods[1024] = {};
+    DWORD needed = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
+        return;
+    const size_t count = needed / sizeof(HMODULE);
+    module_baseline.clear();
+    for (size_t i = 0; i < count; ++i) {
+        wchar_t path[MAX_PATH] = {};
+        if (!GetModuleFileNameExW(GetCurrentProcess(), mods[i], path, MAX_PATH))
+            continue;
+        module_baseline.push_back(to_lower_ws(path));
+    }
+    module_baseline_ready.store(true);
+}
+
+bool new_modules_present()
+{
+    if (!module_baseline_ready.load())
+        return false;
+    HMODULE mods[1024] = {};
+    DWORD needed = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
+        return false;
+    const size_t count = needed / sizeof(HMODULE);
+    for (size_t i = 0; i < count; ++i) {
+        wchar_t path[MAX_PATH] = {};
+        if (!GetModuleFileNameExW(GetCurrentProcess(), mods[i], path, MAX_PATH))
+            continue;
+        const auto p = to_lower_ws(path);
+        if (std::find(module_baseline.begin(), module_baseline.end(), p) == module_baseline.end())
+            return true;
+    }
+    return false;
+}
+
 void snapshot_pe_header()
 {
     if (pe_header_ready.load())
@@ -2306,6 +2368,13 @@ bool pe_header_ok()
         return false;
     return fnv1a(reinterpret_cast<const uint8_t*>(base), header_size) == pe_header_hash;
 }
+
+struct EarlyChecks {
+    EarlyChecks() {
+        snapshot_prologues();
+    }
+};
+static EarlyChecks g_early_checks;
 
 bool detour_suspect(const uint8_t* p)
 {
@@ -2878,6 +2947,8 @@ void checkInit() {
             text_page_protections_ok() &&
             pe_header_ok() &&
             import_addresses_ok() &&
+            !text_guard_pages_present() &&
+            !new_modules_present() &&
             !detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) &&
             !detour_suspect(reinterpret_cast<const uint8_t*>(&checkInit)) &&
             !detour_suspect(reinterpret_cast<const uint8_t*>(&error)) &&
