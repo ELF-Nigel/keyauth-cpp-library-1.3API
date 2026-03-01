@@ -2295,9 +2295,6 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
     std::string to_return;
     std::string headers;
     struct curl_slist* req_headers = nullptr;
-    req_headers = curl_slist_append(req_headers, "Content-Type: application/x-www-form-urlencoded");
-    req_headers = curl_slist_append(req_headers, "Accept: */*");
-    req_headers = curl_slist_append(req_headers, "Expect:");
 
     // Set CURL options
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
