@@ -333,23 +333,27 @@ size_t header_callback(char* buffer, size_t size, size_t nitems, void* userdata)
     size_t totalSize = size * nitems;
 
     std::string header(buffer, totalSize);
-
-    // Convert to lowercase for comparison
-    std::string lowercase = header;
-    std::transform(lowercase.begin(), lowercase.end(), lowercase.begin(), ::tolower);
-
-    // Signature
-    if (lowercase.find("x-signature-ed25519: ") == 0) {
-        signature = header.substr(header.find(": ") + 2);
-        signature.erase(signature.find_last_not_of("\r\n") + 1);
-        //std::cout << "[DEBUG] Captured signature header: " << signature << std::endl;
+    if (header.empty())
+        return totalSize;
+    // trim CRLF
+    while (!header.empty() && (header.back() == '\r' || header.back() == '\n')) {
+        header.pop_back();
     }
+    const auto colon = header.find(':');
+    if (colon == std::string::npos)
+        return totalSize;
+    std::string key = header.substr(0, colon);
+    std::string value = header.substr(colon + 1);
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+        value.erase(value.begin());
+    }
+    std::transform(key.begin(), key.end(), key.begin(), ::tolower);
 
-    // Timestamp
-    if (lowercase.find("x-signature-timestamp: ") == 0) {
-        signatureTimestamp = header.substr(header.find(": ") + 2);
-        signatureTimestamp.erase(signatureTimestamp.find_last_not_of("\r\n") + 1);
-        //std::cout << "[DEBUG] Captured timestamp header: " << signatureTimestamp << std::endl;
+    if (key == "x-signature-ed25519") {
+        signature = value;
+    }
+    if (key == "x-signature-timestamp") {
+        signatureTimestamp = value;
     }
 
     return totalSize;
