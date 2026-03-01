@@ -1666,9 +1666,9 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     if (!prologues_ok()) {
         error(XorStr("function prologue check failed, possible inline hook detected."));
     }
-    if (!iat_virtualprotect_ok()) {
-        error(XorStr("VirtualProtect IAT check failed."));
-    }
+    // if (!iat_virtualprotect_ok()) {
+    //     error(XorStr("VirtualProtect IAT check failed."));
+    // }
     if (!import_addresses_ok()) {
         error(XorStr("import address check failed."));
     }
@@ -2451,9 +2451,9 @@ std::string KeyAuth::api::req(const std::string& data, const std::string& url) {
         !func_region_ok(reinterpret_cast<const void*>(&check_section_integrity))) {
         error(XorStr("function region check failed, possible hook detected."));
     }
-    if (!iat_virtualprotect_ok()) {
-        error(XorStr("VirtualProtect IAT check failed."));
-    }
+    // if (!iat_virtualprotect_ok()) {
+    //     error(XorStr("VirtualProtect IAT check failed."));
+    // }
     if (!import_addresses_ok()) {
         error(XorStr("import address check failed."));
     }
@@ -2859,9 +2859,9 @@ void checkInit() {
         if (timing_anomaly_detected()) {
             error(XorStr("timing anomaly detected, possible time tamper."));
         }
-        if (!iat_virtualprotect_ok()) {
-            error(XorStr("VirtualProtect IAT check failed."));
-        }
+        // if (!iat_virtualprotect_ok()) {
+        //     error(XorStr("VirtualProtect IAT check failed."));
+        // }
         if (!text_hashes_ok()) {
             error(XorStr("text section hash check failed."));
         }
