@@ -94,7 +94,6 @@ bool duplicate_system_modules_present();
 bool user_writable_module_present();
 bool module_has_rwx_section(HMODULE mod);
 bool core_modules_signed();
-bool hypervisor_present();
 static std::wstring get_system_dir();
 static std::wstring get_syswow_dir();
 void snapshot_prologues();
@@ -109,13 +108,8 @@ bool detour_suspect(const uint8_t* p);
 bool import_addresses_ok();
 void snapshot_text_page_protections();
 bool text_page_protections_ok();
-void snapshot_pe_header();
-bool pe_header_ok();
-bool iat_virtualprotect_ok();
+ 
 bool module_allowlist_ok();
-void snapshot_module_baseline();
-bool new_modules_present();
-bool text_guard_pages_present();
 inline void secure_zero(std::string& value) noexcept;
 inline void securewipe(std::string& value) noexcept;
 std::string seed;
@@ -142,11 +136,7 @@ struct TextHash { size_t offset; size_t len; uint32_t hash; };
 std::vector<TextHash> text_hashes;
 std::atomic<bool> text_prot_ready{ false };
 std::vector<std::pair<std::uintptr_t, DWORD>> text_protections;
-std::atomic<bool> pe_header_ready{ false };
-uint32_t pe_header_hash = 0;
 std::atomic<int> heavy_fail_streak{ 0 };
-std::atomic<bool> module_baseline_ready{ false };
-std::vector<std::wstring> module_baseline;
 
 static inline void secure_zero(std::string& value) noexcept
 {
@@ -2085,41 +2075,6 @@ static std::wstring get_syswow_dir()
     return std::wstring(buf);
 }
 
-bool hypervisor_present()
-{
-    int cpu_info[4] = {};
-    __cpuid(cpu_info, 1);
-    const bool hv_bit = (cpu_info[2] & (1 << 31)) != 0;
-    if (hv_bit) {
-        return true;
-    }
-
-    // registry artifacts (conservative)
-    if (reg_key_exists(HKEY_LOCAL_MACHINE, L"HARDWARE\\ACPI\\DSDT\\VBOX__") ||
-        reg_key_exists(HKEY_LOCAL_MACHINE, L"HARDWARE\\ACPI\\DSDT\\VMWARE") ||
-        reg_key_exists(HKEY_LOCAL_MACHINE, L"HARDWARE\\ACPI\\DSDT\\XEN") ||
-        reg_key_exists(HKEY_LOCAL_MACHINE, L"SOFTWARE\\VMware, Inc.\\VMware Tools") ||
-        reg_key_exists(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Oracle\\VirtualBox Guest Additions")) {
-        return true;
-    }
-
-    // file artifacts (drivers/tools)
-    const auto sys32 = get_system_dir();
-    if (!sys32.empty()) {
-        if (file_exists(sys32 + L"\\drivers\\VBoxGuest.sys") ||
-            file_exists(sys32 + L"\\drivers\\VBoxMouse.sys") ||
-            file_exists(sys32 + L"\\drivers\\VBoxSF.sys") ||
-            file_exists(sys32 + L"\\drivers\\VBoxVideo.sys") ||
-            file_exists(sys32 + L"\\drivers\\vmhgfs.sys") ||
-            file_exists(sys32 + L"\\drivers\\vmmouse.sys") ||
-            file_exists(sys32 + L"\\drivers\\vm3dmp.sys") ||
-            file_exists(sys32 + L"\\drivers\\xen.sys")) {
-            return true;
-        }
-    }
-
-    return false;
-}
 
 void snapshot_prologues()
 {
@@ -2138,8 +2093,6 @@ void snapshot_prologues()
     prologues_ready.store(true);
     snapshot_text_hashes();
     snapshot_text_page_protections();
-    snapshot_pe_header();
-    snapshot_module_baseline();
 }
 
 bool prologues_ok()
@@ -2296,109 +2249,6 @@ bool text_page_protections_ok()
     return true;
 }
 
-bool text_guard_pages_present()
-{
-    std::uintptr_t base = 0;
-    size_t size = 0;
-    if (!get_text_section_info(base, size))
-        return false;
-    const size_t page = 0x1000;
-    for (size_t off = 0; off < size; off += page) {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(reinterpret_cast<const void*>(base + off), &mbi, sizeof(mbi)) == 0)
-            continue;
-        if (mbi.Protect & PAGE_GUARD)
-            return true;
-    }
-    return false;
-}
-
-void snapshot_module_baseline()
-{
-    if (module_baseline_ready.load())
-        return;
-    HMODULE mods[1024] = {};
-    DWORD needed = 0;
-    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
-        return;
-    const size_t count = needed / sizeof(HMODULE);
-    module_baseline.clear();
-    for (size_t i = 0; i < count; ++i) {
-        wchar_t path[MAX_PATH] = {};
-        if (!GetModuleFileNameExW(GetCurrentProcess(), mods[i], path, MAX_PATH))
-            continue;
-        module_baseline.push_back(to_lower_ws(path));
-    }
-    module_baseline_ready.store(true);
-}
-
-bool new_modules_present()
-{
-    if (!module_baseline_ready.load())
-        return false;
-    HMODULE mods[1024] = {};
-    DWORD needed = 0;
-    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
-        return false;
-    const size_t count = needed / sizeof(HMODULE);
-    for (size_t i = 0; i < count; ++i) {
-        wchar_t path[MAX_PATH] = {};
-        if (!GetModuleFileNameExW(GetCurrentProcess(), mods[i], path, MAX_PATH))
-            continue;
-        const auto p = to_lower_ws(path);
-        if (std::find(module_baseline.begin(), module_baseline.end(), p) == module_baseline.end())
-            return true;
-    }
-    return false;
-}
-
-void snapshot_pe_header()
-{
-    if (pe_header_ready.load())
-        return;
-    const auto hmodule = GetModuleHandle(nullptr);
-    if (!hmodule)
-        return;
-    const auto base = reinterpret_cast<std::uintptr_t>(hmodule);
-    const auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-        return;
-    const auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE)
-        return;
-    const size_t header_size = nt->OptionalHeader.SizeOfHeaders;
-    if (header_size == 0 || header_size > 0x4000)
-        return;
-    pe_header_hash = fnv1a(reinterpret_cast<const uint8_t*>(base), header_size);
-    pe_header_ready.store(true);
-}
-
-bool pe_header_ok()
-{
-    if (!pe_header_ready.load())
-        return true;
-    const auto hmodule = GetModuleHandle(nullptr);
-    if (!hmodule)
-        return true;
-    const auto base = reinterpret_cast<std::uintptr_t>(hmodule);
-    const auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-        return false;
-    const auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE)
-        return false;
-    const size_t header_size = nt->OptionalHeader.SizeOfHeaders;
-    if (header_size == 0 || header_size > 0x4000)
-        return false;
-    return fnv1a(reinterpret_cast<const uint8_t*>(base), header_size) == pe_header_hash;
-}
-
-struct EarlyChecks {
-    EarlyChecks() {
-        snapshot_prologues();
-    }
-};
-static EarlyChecks g_early_checks;
 
 bool detour_suspect(const uint8_t* p)
 {
@@ -2483,24 +2333,6 @@ static bool iat_get_import_address(HMODULE module, const char* import_name, void
         }
     }
     return true;
-}
-
-bool iat_virtualprotect_ok()
-{
-    HMODULE self = GetModuleHandle(nullptr);
-    FARPROC vp = GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "VirtualProtect");
-    if (!vp)
-        vp = GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "VirtualProtect");
-    if (!vp)
-        return true;
-    bool found = false;
-    void* iat_addr = nullptr;
-    const bool ok = iat_get_import_address(self, "VirtualProtect", iat_addr, found);
-    if (!ok || !found)
-        return true; // allow when not imported
-    if (addr_in_module(iat_addr, L"kernelbase.dll") || addr_in_module(iat_addr, L"kernel32.dll"))
-        return true;
-    return false;
 }
 
 bool module_allowlist_ok()
@@ -2978,7 +2810,6 @@ void checkInit() {
             text_hashes_ok() &&
             text_page_protections_ok() &&
             import_addresses_ok() &&
-            !text_guard_pages_present() &&
             !detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) &&
             !detour_suspect(reinterpret_cast<const uint8_t*>(&checkInit)) &&
             !detour_suspect(reinterpret_cast<const uint8_t*>(&error)) &&
