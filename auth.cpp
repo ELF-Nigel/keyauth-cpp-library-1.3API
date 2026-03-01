@@ -89,9 +89,6 @@ auto check_section_integrity( const char *section_name, bool fix ) -> bool;
 void integrity_check();
 std::string extract_host(const std::string& url);
 bool hosts_override_present(const std::string& host);
-bool module_paths_ok();
-bool duplicate_system_modules_present();
-bool user_writable_module_present();
 bool module_has_rwx_section(HMODULE mod);
 bool core_modules_signed();
 static std::wstring get_system_dir();
@@ -1953,94 +1950,6 @@ bool core_modules_signed()
     return true;
 }
 
-bool module_paths_ok()
-{
-    const wchar_t* kModules[] = { L"ntdll.dll", L"kernel32.dll", L"kernelbase.dll", L"user32.dll" };
-    std::wstring sys32 = get_system_dir();
-    std::wstring syswow = get_syswow_dir();
-    if (!sys32.empty()) sys32 = to_lower_ws(sys32 + L"\\");
-    if (!syswow.empty()) syswow = to_lower_ws(syswow + L"\\");
-
-    for (const auto* name : kModules) {
-        HMODULE mod = GetModuleHandleW(name);
-        if (!mod)
-            continue;
-        wchar_t path[MAX_PATH] = {};
-        if (!GetModuleFileNameW(mod, path, MAX_PATH))
-            return false;
-        std::wstring p = to_lower_ws(path);
-        if (p.rfind(sys32, 0) != 0 && p.rfind(syswow, 0) != 0)
-            return false;
-    }
-    return true;
-}
-
-bool duplicate_system_modules_present()
-{
-    const wchar_t* kModules[] = { L"ntdll.dll", L"kernel32.dll", L"kernelbase.dll", L"user32.dll" };
-    std::wstring sys32 = get_system_dir();
-    std::wstring syswow = get_syswow_dir();
-    if (!sys32.empty()) sys32 = to_lower_ws(sys32 + L"\\");
-    if (!syswow.empty()) syswow = to_lower_ws(syswow + L"\\");
-
-    HMODULE mods[1024] = {};
-    DWORD needed = 0;
-    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
-        return false;
-
-    const size_t count = needed / sizeof(HMODULE);
-    for (size_t i = 0; i < count; ++i) {
-        wchar_t path[MAX_PATH] = {};
-        if (!GetModuleFileNameExW(GetCurrentProcess(), mods[i], path, MAX_PATH))
-            continue;
-        std::wstring p = to_lower_ws(path);
-        const auto name_pos = p.find_last_of(L"\\/");
-        const std::wstring name = (name_pos == std::wstring::npos) ? p : p.substr(name_pos + 1);
-        bool is_target = false;
-        for (const auto* modname : kModules) {
-            if (name == modname) {
-                is_target = true;
-                break;
-            }
-        }
-        if (!is_target)
-            continue;
-        if (p.rfind(sys32, 0) != 0 && p.rfind(syswow, 0) != 0)
-            return true;
-    }
-    return false;
-}
-
-bool user_writable_module_present()
-{
-    HMODULE mods[1024] = {};
-    DWORD needed = 0;
-    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
-        return false;
-
-    wchar_t exe_path[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-    std::wstring exe_dir = exe_path;
-    const auto last_slash = exe_dir.find_last_of(L"\\/");
-    if (last_slash != std::wstring::npos)
-        exe_dir = exe_dir.substr(0, last_slash + 1);
-    exe_dir = to_lower_ws(exe_dir);
-
-    const size_t count = needed / sizeof(HMODULE);
-    for (size_t i = 0; i < count; ++i) {
-        wchar_t path[MAX_PATH] = {};
-        if (!GetModuleFileNameExW(GetCurrentProcess(), mods[i], path, MAX_PATH))
-            continue;
-        std::wstring p = to_lower_ws(path);
-        if (p.rfind(exe_dir, 0) == 0)
-            continue;
-
-        if (path_has_any(p, { L"\\temp\\", L"\\appdata\\local\\temp\\", L"\\downloads\\" }))
-            return true;
-    }
-    return false;
-}
-
 static bool reg_key_exists(HKEY root, const wchar_t* path)
 {
     HKEY h = nullptr;
@@ -2764,7 +2673,7 @@ void checkInit() {
     const auto last_mod = last_module_check.load();
     if (now - last_mod > 60) {
         last_module_check.store(now);
-        if (!module_paths_ok() || duplicate_system_modules_present() || user_writable_module_present() || !core_modules_signed()) {
+        if (!core_modules_signed()) {
             error(XorStr("module path check failed, possible side-load detected."));
         }
     }
