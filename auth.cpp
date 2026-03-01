@@ -116,6 +116,8 @@ bool module_allowlist_ok();
 void snapshot_module_baseline();
 bool new_modules_present();
 bool text_guard_pages_present();
+inline void secure_zero(std::string& value) noexcept;
+inline void securewipe(std::string& value) noexcept;
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
