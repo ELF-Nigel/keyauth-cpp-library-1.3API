@@ -22,6 +22,53 @@ x86 :
 
 4- Lib Configuration -> Preprocessor definiton for CURL -> CURL_STATICLIB
 
+## **Using The Library**
+This section covers a minimal, working integration with the headers in this repo.
+
+1. Add the library headers and sources to your project (or build the `.lib` from this repo).
+2. Include `auth.hpp` in your project file.
+3. Initialize the API once at startup, then call login/license/upgrade as needed.
+4. Keep your build settings on C++17 and link with the same libraries as this repo.
+
+Minimal example:
+```cpp
+#include "auth.hpp"
+
+using namespace KeyAuth;
+
+std::string name = "your_app_name";
+std::string ownerid = "your_owner_id";
+std::string version = "1.0";
+std::string url = "https://keyauth.win/api/1.3/";
+std::string path = ""; // optional
+
+api KeyAuthApp(name, ownerid, version, url, path);
+
+int main() {
+    KeyAuthApp.init();
+    if (!KeyAuthApp.response.success) {
+        return 1;
+    }
+    KeyAuthApp.license("your_license_key");
+    if (!KeyAuthApp.response.success) {
+        return 1;
+    }
+    return 0;
+}
+```
+
+Notes:
+1. If you are using the KeyAuth examples, keep their integrity/session checks intact.
+2. Use the same `CURL_STATICLIB` define as shown above when statically linking.
+3. Rebuild the library after pulling updates to keep everything in sync.
+
+Helpful references (copy and paste into your browser):
+```
+https://github.com/KeyAuth/KeyAuth-CPP-Example
+https://keyauth.cc/app/
+https://keyauth.cc/app/?page=forms
+```
+
 ## **What is KeyAuth?**
 
 KeyAuth is a powerful cloud-based authentication system designed to protect your software from piracy and unauthorized access. With KeyAuth, you can implement secure licensing, user management, and subscription systems in minutes. Client SDKs available for [C#](https://github.com/KeyAuth/KeyAuth-CSHARP-Example), [C++](https://github.com/KeyAuth/KeyAuth-CPP-Example), [Python](https://github.com/KeyAuth/KeyAuth-Python-Example), [Java](https://github.com/KeyAuth-Archive/KeyAuth-JAVA-api), [JavaScript](https://github.com/mazkdevf/KeyAuth-JS-Example), [VB.NET](https://github.com/KeyAuth/KeyAuth-VB-Example), [PHP](https://github.com/KeyAuth/KeyAuth-PHP-Example), [Rust](https://github.com/KeyAuth/KeyAuth-Rust-Example), [Go](https://github.com/mazkdevf/KeyAuth-Go-Example), [Lua](https://github.com/mazkdevf/KeyAuth-Lua-Examples), [Ruby](https://github.com/mazkdevf/KeyAuth-Ruby-Example), and [Perl](https://github.com/mazkdevf/KeyAuth-Perl-Example). KeyAuth has several unique features such as memory streaming, webhook function where you can send requests to API without leaking the API, discord webhook notifications, ban the user securely through the application at your discretion. Feel free to join https://t.me/keyauth if you have questions or suggestions.
