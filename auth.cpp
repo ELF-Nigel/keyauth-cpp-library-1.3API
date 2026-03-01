@@ -327,6 +327,24 @@ size_t write_callback(void* contents, size_t size, size_t nmemb, void* userp) {
     return size * nmemb;
 }
 
+struct PostData {
+    const char* data;
+    size_t len;
+    size_t pos;
+};
+
+size_t read_callback(char* buffer, size_t size, size_t nmemb, void* userp) {
+    auto* pd = static_cast<PostData*>(userp);
+    const size_t cap = size * nmemb;
+    const size_t remaining = (pd->pos < pd->len) ? (pd->len - pd->pos) : 0;
+    const size_t to_copy = remaining < cap ? remaining : cap;
+    if (to_copy > 0) {
+        std::memcpy(buffer, pd->data + pd->pos, to_copy);
+        pd->pos += to_copy;
+    }
+    return to_copy;
+}
+
 // Callback function to handle headers
 size_t header_callback(char* buffer, size_t size, size_t nitems, void* userdata) {
     size_t totalSize = size * nitems;
@@ -2583,13 +2601,18 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
     std::string to_return;
     std::string headers;
 
+    PostData post{ data.c_str(), data.size(), 0 };
+
     // Set CURL options
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_CERTINFO, 1L);
     curl_easy_setopt(curl, CURLOPT_NOPROXY, XorStr("keyauth.win").c_str());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_callback);
+    curl_easy_setopt(curl, CURLOPT_READDATA, &post);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(post.len));
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &to_return);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
