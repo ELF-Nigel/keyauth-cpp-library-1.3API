@@ -2584,7 +2584,9 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
         error(errorMsg);
     }
 
-    debugInfo(data, url, to_return, "Sig: " + signature + "\nTimestamp:" + signatureTimestamp);
+    if (KeyAuth::api::debug) {
+        debugInfo("n/a", "n/a", to_return, "n/a");
+    }
     curl_easy_cleanup(curl);
     secure_zero(data);
     return to_return;
