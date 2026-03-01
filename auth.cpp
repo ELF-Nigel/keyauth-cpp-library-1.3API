@@ -1912,8 +1912,10 @@ bool core_modules_signed()
 bool module_paths_ok()
 {
     const wchar_t* kModules[] = { L"ntdll.dll", L"kernel32.dll", L"kernelbase.dll", L"user32.dll" };
-    std::wstring sys32 = to_lower_ws(get_system_dir() + L"\\");
-    std::wstring syswow = to_lower_ws(get_syswow_dir() + L"\\");
+    std::wstring sys32 = get_system_dir();
+    std::wstring syswow = get_syswow_dir();
+    if (!sys32.empty()) sys32 = to_lower_ws(sys32 + L"\\");
+    if (!syswow.empty()) syswow = to_lower_ws(syswow + L"\\");
 
     for (const auto* name : kModules) {
         HMODULE mod = GetModuleHandleW(name);
@@ -1932,8 +1934,10 @@ bool module_paths_ok()
 bool duplicate_system_modules_present()
 {
     const wchar_t* kModules[] = { L"ntdll.dll", L"kernel32.dll", L"kernelbase.dll", L"user32.dll" };
-    std::wstring sys32 = to_lower_ws(get_system_dir() + L"\\");
-    std::wstring syswow = to_lower_ws(get_syswow_dir() + L"\\");
+    std::wstring sys32 = get_system_dir();
+    std::wstring syswow = get_syswow_dir();
+    if (!sys32.empty()) sys32 = to_lower_ws(sys32 + L"\\");
+    if (!syswow.empty()) syswow = to_lower_ws(syswow + L"\\");
 
     HMODULE mods[1024] = {};
     DWORD needed = 0;
@@ -2014,16 +2018,16 @@ static std::wstring get_system_dir()
 {
     wchar_t buf[MAX_PATH] = {};
     if (GetSystemDirectoryW(buf, MAX_PATH) == 0)
-        return L"C:\\Windows\\System32";
-    return buf;
+        return L"";
+    return std::wstring(buf);
 }
 
 static std::wstring get_syswow_dir()
 {
     wchar_t buf[MAX_PATH] = {};
     if (GetSystemWow64DirectoryW(buf, MAX_PATH) == 0)
-        return L"C:\\Windows\\SysWOW64";
-    return buf;
+        return L"";
+    return std::wstring(buf);
 }
 
 bool hypervisor_present()
@@ -2046,15 +2050,17 @@ bool hypervisor_present()
 
     // file artifacts (drivers/tools)
     const auto sys32 = get_system_dir();
-    if (file_exists(sys32 + L"\\drivers\\VBoxGuest.sys") ||
-        file_exists(sys32 + L"\\drivers\\VBoxMouse.sys") ||
-        file_exists(sys32 + L"\\drivers\\VBoxSF.sys") ||
-        file_exists(sys32 + L"\\drivers\\VBoxVideo.sys") ||
-        file_exists(sys32 + L"\\drivers\\vmhgfs.sys") ||
-        file_exists(sys32 + L"\\drivers\\vmmouse.sys") ||
-        file_exists(sys32 + L"\\drivers\\vm3dmp.sys") ||
-        file_exists(sys32 + L"\\drivers\\xen.sys")) {
-        return true;
+    if (!sys32.empty()) {
+        if (file_exists(sys32 + L"\\drivers\\VBoxGuest.sys") ||
+            file_exists(sys32 + L"\\drivers\\VBoxMouse.sys") ||
+            file_exists(sys32 + L"\\drivers\\VBoxSF.sys") ||
+            file_exists(sys32 + L"\\drivers\\VBoxVideo.sys") ||
+            file_exists(sys32 + L"\\drivers\\vmhgfs.sys") ||
+            file_exists(sys32 + L"\\drivers\\vmmouse.sys") ||
+            file_exists(sys32 + L"\\drivers\\vm3dmp.sys") ||
+            file_exists(sys32 + L"\\drivers\\xen.sys")) {
+            return true;
+        }
     }
 
     return false;
@@ -2383,8 +2389,10 @@ bool module_allowlist_ok()
     if (last_slash != std::wstring::npos)
         exe_dir = exe_dir.substr(0, last_slash + 1);
     exe_dir = to_lower_ws(exe_dir);
-    std::wstring sys32 = to_lower_ws(get_system_dir() + L"\\");
-    std::wstring syswow = to_lower_ws(get_syswow_dir() + L"\\");
+    std::wstring sys32 = get_system_dir();
+    std::wstring syswow = get_syswow_dir();
+    if (!sys32.empty()) sys32 = to_lower_ws(sys32 + L"\\");
+    if (!syswow.empty()) syswow = to_lower_ws(syswow + L"\\");
 
     const size_t count = needed / sizeof(HMODULE);
     for (size_t i = 0; i < count; ++i) {
