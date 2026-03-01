@@ -2340,22 +2340,26 @@ static bool iat_resolves_to(HMODULE module, const char* import_name, const void*
     if (!dir.VirtualAddress)
         return false;
     auto desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
+    bool found = false;
     for (; desc->Name; ++desc) {
         const char* dll = reinterpret_cast<const char*>(base + desc->Name);
-        if (!_stricmp(dll, "KERNEL32.DLL") && !_stricmp(dll, "KERNELBASE.DLL"))
+        if (_stricmp(dll, "KERNEL32.DLL") != 0 && _stricmp(dll, "KERNELBASE.DLL") != 0)
             continue;
         auto thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
-        auto orig = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->OriginalFirstThunk);
+        auto orig = desc->OriginalFirstThunk
+            ? reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->OriginalFirstThunk)
+            : thunk;
         for (; orig->u1.AddressOfData; ++orig, ++thunk) {
             if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG)
                 continue;
             auto import = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + orig->u1.AddressOfData);
             if (strcmp(reinterpret_cast<char*>(import->Name), import_name) == 0) {
+                found = true;
                 return reinterpret_cast<const void*>(thunk->u1.Function) == target;
             }
         }
     }
-    return true;
+    return !found; // if not imported (e.g., static link), do not fail. -nigel
 }
 
 bool iat_virtualprotect_ok()
