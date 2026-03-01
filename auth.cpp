@@ -1912,10 +1912,8 @@ bool core_modules_signed()
 bool module_paths_ok()
 {
     const wchar_t* kModules[] = { L"ntdll.dll", L"kernel32.dll", L"kernelbase.dll", L"user32.dll" };
-    const wchar_t* sysroot_env = _wgetenv(L"SystemRoot");
-    std::wstring sysroot = sysroot_env ? sysroot_env : L"C:\\Windows";
-    std::wstring sys32 = to_lower_ws(sysroot + L"\\System32\\");
-    std::wstring syswow = to_lower_ws(sysroot + L"\\SysWOW64\\");
+    std::wstring sys32 = to_lower_ws(get_system_dir() + L"\\");
+    std::wstring syswow = to_lower_ws(get_syswow_dir() + L"\\");
 
     for (const auto* name : kModules) {
         HMODULE mod = GetModuleHandleW(name);
@@ -1934,10 +1932,8 @@ bool module_paths_ok()
 bool duplicate_system_modules_present()
 {
     const wchar_t* kModules[] = { L"ntdll.dll", L"kernel32.dll", L"kernelbase.dll", L"user32.dll" };
-    const wchar_t* sysroot_env = _wgetenv(L"SystemRoot");
-    std::wstring sysroot = sysroot_env ? sysroot_env : L"C:\\Windows";
-    std::wstring sys32 = to_lower_ws(sysroot + L"\\System32\\");
-    std::wstring syswow = to_lower_ws(sysroot + L"\\SysWOW64\\");
+    std::wstring sys32 = to_lower_ws(get_system_dir() + L"\\");
+    std::wstring syswow = to_lower_ws(get_syswow_dir() + L"\\");
 
     HMODULE mods[1024] = {};
     DWORD needed = 0;
@@ -2014,6 +2010,22 @@ static bool file_exists(const std::wstring& path)
     return (attr != INVALID_FILE_ATTRIBUTES) && !(attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+static std::wstring get_system_dir()
+{
+    wchar_t buf[MAX_PATH] = {};
+    if (GetSystemDirectoryW(buf, MAX_PATH) == 0)
+        return L"C:\\Windows\\System32";
+    return buf;
+}
+
+static std::wstring get_syswow_dir()
+{
+    wchar_t buf[MAX_PATH] = {};
+    if (GetSystemWow64DirectoryW(buf, MAX_PATH) == 0)
+        return L"C:\\Windows\\SysWOW64";
+    return buf;
+}
+
 bool hypervisor_present()
 {
     int cpu_info[4] = {};
@@ -2033,14 +2045,15 @@ bool hypervisor_present()
     }
 
     // file artifacts (drivers/tools)
-    if (file_exists(L"C:\\Windows\\System32\\drivers\\VBoxGuest.sys") ||
-        file_exists(L"C:\\Windows\\System32\\drivers\\VBoxMouse.sys") ||
-        file_exists(L"C:\\Windows\\System32\\drivers\\VBoxSF.sys") ||
-        file_exists(L"C:\\Windows\\System32\\drivers\\VBoxVideo.sys") ||
-        file_exists(L"C:\\Windows\\System32\\drivers\\vmhgfs.sys") ||
-        file_exists(L"C:\\Windows\\System32\\drivers\\vmmouse.sys") ||
-        file_exists(L"C:\\Windows\\System32\\drivers\\vm3dmp.sys") ||
-        file_exists(L"C:\\Windows\\System32\\drivers\\xen.sys")) {
+    const auto sys32 = get_system_dir();
+    if (file_exists(sys32 + L"\\drivers\\VBoxGuest.sys") ||
+        file_exists(sys32 + L"\\drivers\\VBoxMouse.sys") ||
+        file_exists(sys32 + L"\\drivers\\VBoxSF.sys") ||
+        file_exists(sys32 + L"\\drivers\\VBoxVideo.sys") ||
+        file_exists(sys32 + L"\\drivers\\vmhgfs.sys") ||
+        file_exists(sys32 + L"\\drivers\\vmmouse.sys") ||
+        file_exists(sys32 + L"\\drivers\\vm3dmp.sys") ||
+        file_exists(sys32 + L"\\drivers\\xen.sys")) {
         return true;
     }
 
@@ -2370,10 +2383,8 @@ bool module_allowlist_ok()
     if (last_slash != std::wstring::npos)
         exe_dir = exe_dir.substr(0, last_slash + 1);
     exe_dir = to_lower_ws(exe_dir);
-    const wchar_t* sysroot_env = _wgetenv(L"SystemRoot");
-    std::wstring sysroot = sysroot_env ? sysroot_env : L"C:\\Windows";
-    std::wstring sys32 = to_lower_ws(sysroot + L"\\System32\\");
-    std::wstring syswow = to_lower_ws(sysroot + L"\\SysWOW64\\");
+    std::wstring sys32 = to_lower_ws(get_system_dir() + L"\\");
+    std::wstring syswow = to_lower_ws(get_syswow_dir() + L"\\");
 
     const size_t count = needed / sizeof(HMODULE);
     for (size_t i = 0; i < count; ++i) {
