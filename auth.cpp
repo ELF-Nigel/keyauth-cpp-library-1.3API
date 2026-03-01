@@ -681,9 +681,9 @@ void KeyAuth::api::web_login()
         HTTP_SET_NULL_ID(&requestId);
         int bufferSize = 4096;
         int requestSize = sizeof(HTTP_REQUEST) + bufferSize;
-        BYTE* buffer = new BYTE[requestSize];
-        PHTTP_REQUEST pRequest = (PHTTP_REQUEST)buffer;
-        RtlZeroMemory(buffer, requestSize);
+        auto buffer = std::make_unique<BYTE[]>(requestSize);
+        PHTTP_REQUEST pRequest = (PHTTP_REQUEST)buffer.get();
+        RtlZeroMemory(buffer.get(), requestSize);
         ULONG bytesReturned;
         result = HttpReceiveHttpRequest(
             requestQueueHandle,
@@ -746,7 +746,6 @@ void KeyAuth::api::web_login()
                 NULL
             );
 
-            delete[]buffer;
             continue;
         }
 
@@ -858,8 +857,6 @@ void KeyAuth::api::web_login()
                     going = false;
                 }
 
-                delete[]buffer;
-
                 if (!success)
                     LI_FN(exit)(0);
             }
@@ -921,9 +918,9 @@ void KeyAuth::api::button(std::string button)
         HTTP_SET_NULL_ID(&requestId);
         int bufferSize = 4096;
         int requestSize = sizeof(HTTP_REQUEST) + bufferSize;
-        BYTE* buffer = new BYTE[requestSize];
-        PHTTP_REQUEST pRequest = (PHTTP_REQUEST)buffer;
-        RtlZeroMemory(buffer, requestSize);
+        auto buffer = std::make_unique<BYTE[]>(requestSize);
+        PHTTP_REQUEST pRequest = (PHTTP_REQUEST)buffer.get();
+        RtlZeroMemory(buffer.get(), requestSize);
         ULONG bytesReturned;
         result = HttpReceiveHttpRequest(
             requestQueueHandle,
@@ -986,7 +983,6 @@ void KeyAuth::api::button(std::string button)
             NULL
         );
 
-        delete[]buffer;
     }
 }
 
