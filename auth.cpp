@@ -109,7 +109,6 @@ bool import_addresses_ok();
 void snapshot_text_page_protections();
 bool text_page_protections_ok();
  
-bool module_allowlist_ok();
 inline void secure_zero(std::string& value) noexcept;
 inline void securewipe(std::string& value) noexcept;
 std::string seed;
@@ -2335,37 +2334,6 @@ static bool iat_get_import_address(HMODULE module, const char* import_name, void
     return true;
 }
 
-bool module_allowlist_ok()
-{
-    HMODULE mods[1024] = {};
-    DWORD needed = 0;
-    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
-        return false;
-    wchar_t exe_path[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-    std::wstring exe_dir = exe_path;
-    const auto last_slash = exe_dir.find_last_of(L"\\/");
-    if (last_slash != std::wstring::npos)
-        exe_dir = exe_dir.substr(0, last_slash + 1);
-    exe_dir = to_lower_ws(exe_dir);
-    std::wstring sys32 = get_system_dir();
-    std::wstring syswow = get_syswow_dir();
-    if (!sys32.empty()) sys32 = to_lower_ws(sys32 + L"\\");
-    if (!syswow.empty()) syswow = to_lower_ws(syswow + L"\\");
-
-    const size_t count = needed / sizeof(HMODULE);
-    for (size_t i = 0; i < count; ++i) {
-        wchar_t path[MAX_PATH] = {};
-        if (!GetModuleFileNameExW(GetCurrentProcess(), mods[i], path, MAX_PATH))
-            continue;
-        std::wstring p = to_lower_ws(path);
-        if (p.rfind(sys32, 0) == 0 || p.rfind(syswow, 0) == 0 || p.rfind(exe_dir, 0) == 0)
-            continue;
-        return false;
-    }
-    return true;
-}
-
 void heartbeat_thread(KeyAuth::api* instance)
 {
     std::random_device rd;
@@ -2796,7 +2764,7 @@ void checkInit() {
     const auto last_mod = last_module_check.load();
     if (now - last_mod > 60) {
         last_module_check.store(now);
-        if (!module_paths_ok() || duplicate_system_modules_present() || user_writable_module_present() || !core_modules_signed() || !module_allowlist_ok()) {
+        if (!module_paths_ok() || duplicate_system_modules_present() || user_writable_module_present() || !core_modules_signed()) {
             error(XorStr("module path check failed, possible side-load detected."));
         }
     }
