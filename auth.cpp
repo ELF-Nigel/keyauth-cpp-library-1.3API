@@ -34,11 +34,13 @@
 
 #pragma comment(lib, "rpcrt4.lib")
 #pragma comment(lib, "httpapi.lib")
+#pragma comment(lib, "psapi.lib")
 
 #include <cstdio>
 #include <iostream>
 #include <memory>
 #include <algorithm>
+#include <psapi.h>
 #include <stdexcept>
 #include <string>
 #include <array>
@@ -80,6 +82,7 @@ void integrity_watchdog();
 std::string extract_host(const std::string& url);
 bool hosts_override_present(const std::string& host);
 bool module_paths_ok();
+bool duplicate_system_modules_present();
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
@@ -1795,6 +1798,42 @@ bool module_paths_ok()
     return true;
 }
 
+bool duplicate_system_modules_present()
+{
+    const wchar_t* kModules[] = { L"ntdll.dll", L"kernel32.dll", L"kernelbase.dll", L"user32.dll" };
+    const wchar_t* sysroot_env = _wgetenv(L"SystemRoot");
+    std::wstring sysroot = sysroot_env ? sysroot_env : L"C:\\Windows";
+    std::wstring sys32 = to_lower_ws(sysroot + L"\\System32\\");
+    std::wstring syswow = to_lower_ws(sysroot + L"\\SysWOW64\\");
+
+    HMODULE mods[1024] = {};
+    DWORD needed = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
+        return false;
+
+    const size_t count = needed / sizeof(HMODULE);
+    for (size_t i = 0; i < count; ++i) {
+        wchar_t path[MAX_PATH] = {};
+        if (!GetModuleFileNameExW(GetCurrentProcess(), mods[i], path, MAX_PATH))
+            continue;
+        std::wstring p = to_lower_ws(path);
+        const auto name_pos = p.find_last_of(L"\\/");
+        const std::wstring name = (name_pos == std::wstring::npos) ? p : p.substr(name_pos + 1);
+        bool is_target = false;
+        for (const auto* modname : kModules) {
+            if (name == modname) {
+                is_target = true;
+                break;
+            }
+        }
+        if (!is_target)
+            continue;
+        if (p.rfind(sys32, 0) != 0 && p.rfind(syswow, 0) != 0)
+            return true;
+    }
+    return false;
+}
+
 void KeyAuth::api::setDebug(bool value) {
     KeyAuth::api::debug = value;
 }
@@ -2181,7 +2220,7 @@ void checkInit() {
     const auto last_mod = last_module_check.load();
     if (now - last_mod > 60) {
         last_module_check.store(now);
-        if (!module_paths_ok()) {
+        if (!module_paths_ok() || duplicate_system_modules_present()) {
             error(XorStr("module path check failed, possible side-load detected."));
         }
     }
@@ -2213,7 +2252,7 @@ void integrity_watchdog() {
         const auto last_mod = last_module_check.load();
         if (now - last_mod > 120) {
             last_module_check.store(now);
-            if (!module_paths_ok()) {
+            if (!module_paths_ok() || duplicate_system_modules_present()) {
                 error(XorStr("module path check failed, possible side-load detected."));
             }
         }
