@@ -85,7 +85,6 @@ std::string generate_random_number();
 std::string curl_escape(CURL* curl, const std::string& input);
 auto check_section_integrity( const char *section_name, bool fix ) -> bool;
 void integrity_check();
-void integrity_watchdog();
 std::string extract_host(const std::string& url);
 bool hosts_override_present(const std::string& host);
 bool module_paths_ok();
@@ -114,13 +113,11 @@ std::array<uint8_t, 16> pro_verify{};
 std::array<uint8_t, 16> pro_checkinit{};
 std::array<uint8_t, 16> pro_error{};
 std::array<uint8_t, 16> pro_integrity{};
-std::array<uint8_t, 16> pro_watchdog{};
 std::array<uint8_t, 16> pro_section{};
 
 void KeyAuth::api::init()
 {
     std::thread(runChecks).detach();
-    std::thread(integrity_watchdog).detach();
     snapshot_prologues();
     seed = generate_random_number();
     std::atexit([]() { cleanUpSeedData(seed); });
@@ -2012,14 +2009,12 @@ void snapshot_prologues()
     const auto check_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&checkInit));
     const auto error_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&error));
     const auto integ_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&integrity_check));
-    const auto watch_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&integrity_watchdog));
     const auto section_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&check_section_integrity));
     std::memcpy(pro_req.data(), req_ptr, pro_req.size());
     std::memcpy(pro_verify.data(), verify_ptr, pro_verify.size());
     std::memcpy(pro_checkinit.data(), check_ptr, pro_checkinit.size());
     std::memcpy(pro_error.data(), error_ptr, pro_error.size());
     std::memcpy(pro_integrity.data(), integ_ptr, pro_integrity.size());
-    std::memcpy(pro_watchdog.data(), watch_ptr, pro_watchdog.size());
     std::memcpy(pro_section.data(), section_ptr, pro_section.size());
     prologues_ready.store(true);
 }
@@ -2033,14 +2028,12 @@ bool prologues_ok()
     const auto check_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&checkInit));
     const auto error_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&error));
     const auto integ_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&integrity_check));
-    const auto watch_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&integrity_watchdog));
     const auto section_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&check_section_integrity));
     return std::memcmp(pro_req.data(), req_ptr, pro_req.size()) == 0 &&
         std::memcmp(pro_verify.data(), verify_ptr, pro_verify.size()) == 0 &&
         std::memcmp(pro_checkinit.data(), check_ptr, pro_checkinit.size()) == 0 &&
         std::memcmp(pro_error.data(), error_ptr, pro_error.size()) == 0 &&
         std::memcmp(pro_integrity.data(), integ_ptr, pro_integrity.size()) == 0 &&
-        std::memcmp(pro_watchdog.data(), watch_ptr, pro_watchdog.size()) == 0 &&
         std::memcmp(pro_section.data(), section_ptr, pro_section.size()) == 0;
 }
 
@@ -2457,7 +2450,6 @@ void checkInit() {
         !func_region_ok(reinterpret_cast<const void*>(&checkInit)) ||
         !func_region_ok(reinterpret_cast<const void*>(&error)) ||
         !func_region_ok(reinterpret_cast<const void*>(&integrity_check)) ||
-        !func_region_ok(reinterpret_cast<const void*>(&integrity_watchdog)) ||
         !func_region_ok(reinterpret_cast<const void*>(&check_section_integrity))) {
         error(XorStr("function region check failed, possible hook detected."));
     }
@@ -2476,45 +2468,6 @@ void integrity_check() {
     }
 }
 
-void integrity_watchdog() {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<int> sleep_seconds(20, 50);
-    while (true) {
-        Sleep(static_cast<DWORD>(sleep_seconds(gen) * 1000));
-        if (!initialized || !LoggedIn.load())
-            continue;
-        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        const auto last_mod = last_module_check.load();
-        if (now - last_mod > 120) {
-            last_module_check.store(now);
-            if (!module_paths_ok() || duplicate_system_modules_present() || user_writable_module_present() || !core_modules_signed() || hypervisor_present()) {
-                error(XorStr("module path check failed, possible side-load detected."));
-            }
-        }
-        if (!prologues_ok()) {
-            error(XorStr("function prologue check failed, possible inline hook detected."));
-        }
-        if (!func_region_ok(reinterpret_cast<const void*>(&KeyAuth::api::req)) ||
-            !func_region_ok(reinterpret_cast<const void*>(&VerifyPayload)) ||
-            !func_region_ok(reinterpret_cast<const void*>(&checkInit)) ||
-            !func_region_ok(reinterpret_cast<const void*>(&error)) ||
-            !func_region_ok(reinterpret_cast<const void*>(&integrity_check)) ||
-            !func_region_ok(reinterpret_cast<const void*>(&integrity_watchdog)) ||
-            !func_region_ok(reinterpret_cast<const void*>(&check_section_integrity))) {
-            error(XorStr("function region check failed, possible hook detected."));
-        }
-        if (check_section_integrity(XorStr(".text").c_str(), false)) {
-            const int streak = integrity_fail_streak.fetch_add(1) + 1;
-            if (streak >= 2) {
-                error(XorStr("check_section_integrity() failed, don't tamper with the program."));
-            }
-        } else {
-            integrity_fail_streak.store(0);
-        }
-    }
-}
 // code submitted in pull request from https://github.com/BINM7MD
 BOOL bDataCompare(const BYTE* pData, const BYTE* bMask, const char* szMask)
 {
