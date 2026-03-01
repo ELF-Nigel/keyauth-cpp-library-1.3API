@@ -62,6 +62,26 @@ Notes:
 2. Use the same `CURL_STATICLIB` define as shown above when statically linking.
 3. Rebuild the library after pulling updates to keep everything in sync.
 
+## **Security Features (Built-In)**
+The library ships with security checks enabled by default. You do not need to manually call anything beyond `init()` and a normal login/license call.
+
+What runs automatically:
+1. **Integrity checks** (prologue, region, section hash, PE header, page protections).
+2. **Module checks** (system module paths, signatures, RWX detection, user-writable paths, allowlist).
+3. **Hosts-file checks** for API host tampering.
+4. **Hypervisor detection** (conservative, low false positives).
+5. **Timing anomaly checks** to detect time tamper.
+6. **Session heartbeat** after successful login/license/upgrade/web login.
+
+How to keep security enabled:
+1. Always call `KeyAuthApp.init()` once before any other API call.
+2. Do not remove the built-in checks or tamper with the library internals.
+3. Keep your application linked against the updated library after pulling changes.
+
+How to verify it is running:
+1. Use the library normally — the checks are automatic.
+2. If a check fails, the library will fail closed with an error message.
+
 Helpful references (copy and paste into your browser):
 ```
 https://github.com/KeyAuth/KeyAuth-CPP-Example
