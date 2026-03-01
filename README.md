@@ -92,6 +92,25 @@ If you see security failures, common causes include:
 
 If you need to allow specific overlays or tools, add them to an allowlist in the code and rebuild the library.
 
+## **Changelog (Overhaul Summary)**
+This list summarizes all changes made in the overhaul:
+1. **Security checks**: `.text` integrity, prologue snapshots, function region validation, detour detection.
+2. **Hashing & headers**: `.text` slice hashing, PE header hash validation.
+3. **Memory protections**: `.text` page protection checks and guard‑page detection.
+4. **Module validation**: System32/SysWOW64 path checks, duplicate module detection, allowlist, new‑module detection.
+5. **Module trust**: Microsoft signature verification for core DLLs, RWX section detection.
+6. **Environment checks**: hypervisor detection and timing anomaly detection.
+7. **Import checks**: import address validation; VirtualProtect IAT check (only when imported).
+8. **Network hardening**: hosts‑file override detection for API host.
+9. **Session hardening**: session heartbeat after successful login/license/upgrade/web login.
+10. **DLL search order**: hardened DLL lookup and removed current‑dir hijacking.
+11. **String exposure**: request data zeroized after use; sensitive parameters wiped via `ScopeWipe`.
+12. **Debug logging**: minimized request/URL logging to reduce in‑memory exposure.
+13. **Parsing hardening**: safer JSON parsing and substring handling to avoid crashes.
+14. **Curl safety**: fixed cleanup issues; enforced static libcurl linkage.
+15. **Module path APIs**: removed hardcoded System32 paths (uses `GetSystemDirectoryW`).
+16. **Example/docs**: added usage section, security feature docs, and troubleshooting guidance.
+
 Helpful references (copy and paste into your browser):
 ```
 https://github.com/KeyAuth/KeyAuth-CPP-Example
