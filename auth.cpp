@@ -147,6 +147,26 @@ std::atomic<int> heavy_fail_streak{ 0 };
 std::atomic<bool> module_baseline_ready{ false };
 std::vector<std::wstring> module_baseline;
 
+static void secure_zero(std::string& value)
+{
+    if (value.empty())
+        return;
+    SecureZeroMemory(value.data(), value.size());
+    value.clear();
+    value.shrink_to_fit();
+}
+
+static void securewipe(std::string& value)
+{
+    secure_zero(value);
+}
+
+struct ScopeWipe {
+    std::string* value;
+    explicit ScopeWipe(std::string& v) : value(&v) {}
+    ~ScopeWipe() { securewipe(*value); }
+};
+
 void KeyAuth::api::init()
 {
     // harden dll search order to reduce current-dir hijacks
@@ -2043,26 +2063,6 @@ static bool file_exists(const std::wstring& path)
     const DWORD attr = GetFileAttributesW(path.c_str());
     return (attr != INVALID_FILE_ATTRIBUTES) && !(attr & FILE_ATTRIBUTE_DIRECTORY);
 }
-
-static void secure_zero(std::string& value)
-{
-    if (value.empty())
-        return;
-    SecureZeroMemory(value.data(), value.size());
-    value.clear();
-    value.shrink_to_fit();
-}
-
-static void securewipe(std::string& value)
-{
-    secure_zero(value);
-}
-
-struct ScopeWipe {
-    std::string* value;
-    explicit ScopeWipe(std::string& v) : value(&v) {}
-    ~ScopeWipe() { securewipe(*value); }
-};
 
 static std::wstring get_system_dir()
 {
