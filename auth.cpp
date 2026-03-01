@@ -2602,6 +2602,8 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
     std::string headers;
     struct curl_slist* req_headers = nullptr;
     req_headers = curl_slist_append(req_headers, "Content-Type: application/x-www-form-urlencoded");
+    req_headers = curl_slist_append(req_headers, "Accept: */*");
+    req_headers = curl_slist_append(req_headers, "Expect:");
 
     PostData post{ data.c_str(), data.size(), 0 };
 
@@ -2616,11 +2618,13 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
     curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_callback);
     curl_easy_setopt(curl, CURLOPT_READDATA, &post);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(post.len));
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(post.len));
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &to_return);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, &headers);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, req_headers);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "KeyAuth");
 
     // Perform the request
     CURLcode code = curl_easy_perform(curl);
