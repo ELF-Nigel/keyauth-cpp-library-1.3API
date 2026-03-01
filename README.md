@@ -66,12 +66,11 @@ Notes:
 The library ships with security checks enabled by default. You do not need to manually call anything beyond `init()` and a normal login/license call.
 
 What runs automatically:
-1. **Integrity checks** (prologue, region, section hash, PE header, page protections).
-2. **Module checks** (system module paths, signatures, RWX detection, user-writable paths, allowlist).
+1. **Integrity checks** (prologue snapshots, function region validation, `.text` hashing, page protections).
+2. **Module checks** (core module signature verification + RWX section detection).
 3. **Hosts-file checks** for API host tampering.
-4. **Hypervisor detection** (conservative, low false positives).
-5. **Timing anomaly checks** to detect time tamper.
-6. **Session heartbeat** after successful login/license/upgrade/web login.
+4. **Timing anomaly checks** to detect time tamper.
+5. **Session heartbeat** after successful login/license/upgrade/web login.
 
 How to keep security enabled:
 1. Always call `KeyAuthApp.init()` once before any other API call.
@@ -82,34 +81,36 @@ How to verify it is running:
 1. Use the library normally — the checks are automatic.
 2. If a check fails, the library will fail closed with an error message.
 
+## **Optional Hardening Ideas (Not Enabled)**
+These are intentionally **not** enabled in the library to avoid false positives, but you can add them if your app needs them.
+
+1. **PE header erase**: wipe PE header pages after load to make casual dumping harder. This is not a check; it simply reduces dump quality.
+2. **Module allowlists**: require a strict set of loaded modules; this breaks overlays and many legitimate plugins.
+3. **System module path checks**: enforce System32/SysWOW64-only paths; can fail on custom Windows installs.
+4. **Hypervisor detection**: block VMs; useful for niche threat models but unfriendly to legit users.
+5. **VirtualProtect IAT validation**: detect IAT hooks; can false-positive in some environments.
+
 ## **Security Troubleshooting**
 If you see security failures, common causes include:
-1. **DLL injection / overlays**: third‑party overlays or injectors can trip module allowlists.
-2. **Modified system DLLs**: non‑Microsoft versions or patched DLLs will be rejected.
-3. **Time tampering**: manual clock changes or large time skew can trigger timing checks.
-4. **VMs/Hypervisors**: running inside a VM can trigger hypervisor detection.
-5. **Patched binaries**: inline hooks/NOP patches or modified `.text` will fail integrity checks.
-
-If you need to allow specific overlays or tools, add them to an allowlist in the code and rebuild the library.
+1. **Modified system DLLs**: non‑Microsoft versions or patched DLLs will be rejected.
+2. **Time tampering**: manual clock changes or large time skew can trigger timing checks.
+3. **Patched binaries**: inline hooks/NOP patches or modified `.text` will fail integrity checks.
 
 ## **Changelog (Overhaul Summary)**
 This list summarizes all changes made in the overhaul:
-1. **Security checks**: `.text` integrity, prologue snapshots, function region validation, detour detection.
-2. **Hashing & headers**: `.text` slice hashing, PE header hash validation.
-3. **Memory protections**: `.text` page protection checks and guard‑page detection.
-4. **Module validation**: System32/SysWOW64 path checks, duplicate module detection, allowlist, new‑module detection.
-5. **Module trust**: Microsoft signature verification for core DLLs, RWX section detection.
-6. **Environment checks**: hypervisor detection and timing anomaly detection.
-7. **Import checks**: import address validation; VirtualProtect IAT check (only when imported).
-8. **Network hardening**: hosts‑file override detection for API host.
-9. **Session hardening**: session heartbeat after successful login/license/upgrade/web login.
-10. **DLL search order**: hardened DLL lookup and removed current‑dir hijacking.
-11. **String exposure**: request data zeroized after use; sensitive parameters wiped via `ScopeWipe`.
-12. **Debug logging**: minimized request/URL logging to reduce in‑memory exposure.
-13. **Parsing hardening**: safer JSON parsing and substring handling to avoid crashes.
-14. **Curl safety**: fixed cleanup issues; enforced static libcurl linkage.
-15. **Module path APIs**: removed hardcoded System32 paths (uses `GetSystemDirectoryW`).
-16. **Example/docs**: added usage section, security feature docs, and troubleshooting guidance.
+1. **Integrity checks**: prologue snapshots, function region validation, detour detection, `.text` slice hashing, page protections.
+2. **Module trust**: Microsoft signature verification for core DLLs, RWX section detection.
+3. **Timing checks**: timing anomaly detection to catch clock tamper.
+4. **Import checks**: import address validation.
+5. **Network hardening**: hosts‑file override detection for API host.
+6. **Session hardening**: session heartbeat after successful login/license/upgrade/web login.
+7. **DLL search order**: hardened DLL lookup and removed current‑dir hijacking.
+8. **String exposure**: request data zeroized after use; sensitive parameters wiped via `ScopeWipe`.
+9. **Debug logging**: minimized request/URL logging to reduce in‑memory exposure.
+10. **Parsing hardening**: safer JSON parsing and substring handling to avoid crashes.
+11. **Curl safety**: fixed cleanup issues; enforced static libcurl linkage.
+12. **Module path APIs**: removed hardcoded System32 paths (uses `GetSystemDirectoryW`).
+13. **Example/docs**: added usage section, security feature docs, and troubleshooting guidance.
 
 Helpful references (copy and paste into your browser):
 ```

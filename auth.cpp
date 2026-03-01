@@ -1932,6 +1932,7 @@ static bool verify_signature(const std::wstring& path)
 
 bool core_modules_signed()
 {
+    // verify core dll signatures and reject rwx sections -nigel
     const wchar_t* kModules[] = { L"ntdll.dll", L"kernel32.dll", L"kernelbase.dll", L"user32.dll" };
     for (const auto* name : kModules) {
         HMODULE mod = GetModuleHandleW(name);
@@ -2271,6 +2272,7 @@ void KeyAuth::api::setDebug(bool value) {
 std::string KeyAuth::api::req(std::string data, const std::string& url) {
     signature.clear();
     signatureTimestamp.clear();
+    // gate requests on integrity checks to reduce bypasses -nigel
     integrity_check();
     if (!prologues_ok()) {
         error(XorStr("function prologue check failed, possible inline hook detected."));
@@ -2283,6 +2285,7 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
         error(XorStr("function region check failed, possible hook detected."));
     }
     const auto host = extract_host(url);
+    // block hosts-file redirects for api host -nigel
     if (hosts_override_present(host)) {
         error(XorStr("Hosts file override detected for API host."));
     }
@@ -2668,6 +2671,7 @@ void checkInit() {
     const auto last_mod = last_module_check.load();
     if (now - last_mod > 60) {
         last_module_check.store(now);
+        // core module trust check to detect tampered system dlls -nigel
         if (!core_modules_signed()) {
             error(XorStr("module path check failed, possible side-load detected."));
         }
@@ -2675,9 +2679,11 @@ void checkInit() {
     const auto last_periodic = last_periodic_check.load();
     if (now - last_periodic > 30) {
         last_periodic_check.store(now);
+        // detect basic clock tampering to block expired key reuse -nigel
         if (timing_anomaly_detected()) {
             error(XorStr("timing anomaly detected, possible time tamper."));
         }
+        // periodic integrity sweep across code regions -nigel
         const bool heavy_ok =
             text_hashes_ok() &&
             text_page_protections_ok() &&
