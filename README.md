@@ -132,12 +132,10 @@ This list summarizes all changes made in the overhaul:
 12. **Module path APIs**: removed hardcoded System32 paths (uses `GetSystemDirectoryW`).
 13. **Example/docs**: added usage section, security feature docs, and troubleshooting guidance.
 
-Helpful references (copy and paste into your browser):
-```
-https://github.com/KeyAuth/KeyAuth-CPP-Example
-https://keyauth.cc/app/
-https://keyauth.cc/app/?page=forms
-```
+Helpful references:
+- https://github.com/KeyAuth/KeyAuth-CPP-Example
+- https://keyauth.cc/app/
+- https://keyauth.cc/app/?page=forms
 
 ## **What is KeyAuth?**
 
