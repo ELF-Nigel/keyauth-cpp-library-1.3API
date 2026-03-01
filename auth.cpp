@@ -149,6 +149,19 @@ std::vector<std::wstring> module_baseline;
 
 void KeyAuth::api::init()
 {
+    // harden dll search order to reduce current-dir hijacks
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS);
+    SetDllDirectoryW(L"");
+    {
+        wchar_t exe_path[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+        std::wstring exe_dir = exe_path;
+        const auto last_slash = exe_dir.find_last_of(L"\\/");
+        if (last_slash != std::wstring::npos) {
+            exe_dir = exe_dir.substr(0, last_slash);
+            AddDllDirectory(exe_dir.c_str());
+        }
+    }
     std::thread(runChecks).detach();
     snapshot_prologues();
     seed = generate_random_number();
