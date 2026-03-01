@@ -1644,6 +1644,9 @@ void KeyAuth::api::logout() {
 
 int VerifyPayload(std::string signature, std::string timestamp, std::string body)
 {
+    if (!prologues_ok()) {
+        error(XorStr("function prologue check failed, possible inline hook detected."));
+    }
     integrity_check();
     long long unix_timestamp = 0;
     try {
@@ -2105,6 +2108,17 @@ std::string KeyAuth::api::req(const std::string& data, const std::string& url) {
     signature.clear();
     signatureTimestamp.clear();
     integrity_check();
+    if (!prologues_ok()) {
+        error(XorStr("function prologue check failed, possible inline hook detected."));
+    }
+    if (!func_region_ok(reinterpret_cast<const void*>(&KeyAuth::api::req)) ||
+        !func_region_ok(reinterpret_cast<const void*>(&VerifyPayload)) ||
+        !func_region_ok(reinterpret_cast<const void*>(&checkInit)) ||
+        !func_region_ok(reinterpret_cast<const void*>(&error)) ||
+        !func_region_ok(reinterpret_cast<const void*>(&integrity_check)) ||
+        !func_region_ok(reinterpret_cast<const void*>(&check_section_integrity))) {
+        error(XorStr("function region check failed, possible hook detected."));
+    }
     const auto host = extract_host(url);
     if (hosts_override_present(host)) {
         error(XorStr("Hosts file override detected for API host."));
