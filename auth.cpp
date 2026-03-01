@@ -2274,6 +2274,7 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
     signatureTimestamp.clear();
     // gate requests on integrity checks to reduce bypasses -nigel
     integrity_check();
+    // usage: keep this in req() so every api call is protected -nigel
     if (!prologues_ok()) {
         error(XorStr("function prologue check failed, possible inline hook detected."));
     }
@@ -2666,6 +2667,7 @@ void checkInit() {
     if (!initialized) {
         error(XorStr("You need to run the KeyAuthApp.init(); function before any other KeyAuth functions"));
     }
+    // usage: call init() once at startup; checks run automatically after that -nigel
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     const auto last_mod = last_module_check.load();
