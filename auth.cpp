@@ -2312,15 +2312,20 @@ static bool addr_in_module(const void* addr, const wchar_t* module_name)
 
 bool import_addresses_ok()
 {
-    // wintrust functions should resolve inside wintrust.dll
-    if (!addr_in_module(reinterpret_cast<const void*>(&WinVerifyTrust), L"wintrust.dll"))
-        return false;
-    // VirtualQuery should be inside kernelbase/kernel32
-    if (!addr_in_module(reinterpret_cast<const void*>(&VirtualQuery), L"kernelbase.dll") &&
-        !addr_in_module(reinterpret_cast<const void*>(&VirtualQuery), L"kernel32.dll"))
-        return false;
-    // curl functions should live in main module when statically linked
-    if (!addr_in_module(reinterpret_cast<const void*>(&curl_easy_perform), nullptr))
+    // wintrust functions should resolve inside wintrust.dll when loaded
+    if (GetModuleHandleW(L"wintrust.dll")) {
+        if (!addr_in_module(reinterpret_cast<const void*>(&WinVerifyTrust), L"wintrust.dll"))
+            return false;
+    }
+    // VirtualQuery should be inside kernelbase/kernel32 when loaded
+    if (GetModuleHandleW(L"kernelbase.dll") || GetModuleHandleW(L"kernel32.dll")) {
+        if (!addr_in_module(reinterpret_cast<const void*>(&VirtualQuery), L"kernelbase.dll") &&
+            !addr_in_module(reinterpret_cast<const void*>(&VirtualQuery), L"kernel32.dll"))
+            return false;
+    }
+    // curl functions can live in main module (static) or libcurl.dll (dynamic)
+    if (!addr_in_module(reinterpret_cast<const void*>(&curl_easy_perform), nullptr) &&
+        !addr_in_module(reinterpret_cast<const void*>(&curl_easy_perform), L"libcurl.dll"))
         return false;
     return true;
 }
