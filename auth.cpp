@@ -112,6 +112,10 @@ std::atomic<bool> prologues_ready{ false };
 std::array<uint8_t, 16> pro_req{};
 std::array<uint8_t, 16> pro_verify{};
 std::array<uint8_t, 16> pro_checkinit{};
+std::array<uint8_t, 16> pro_error{};
+std::array<uint8_t, 16> pro_integrity{};
+std::array<uint8_t, 16> pro_watchdog{};
+std::array<uint8_t, 16> pro_section{};
 
 void KeyAuth::api::init()
 {
@@ -2006,9 +2010,17 @@ void snapshot_prologues()
     const auto req_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&KeyAuth::api::req));
     const auto verify_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&VerifyPayload));
     const auto check_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&checkInit));
+    const auto error_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&error));
+    const auto integ_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&integrity_check));
+    const auto watch_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&integrity_watchdog));
+    const auto section_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&check_section_integrity));
     std::memcpy(pro_req.data(), req_ptr, pro_req.size());
     std::memcpy(pro_verify.data(), verify_ptr, pro_verify.size());
     std::memcpy(pro_checkinit.data(), check_ptr, pro_checkinit.size());
+    std::memcpy(pro_error.data(), error_ptr, pro_error.size());
+    std::memcpy(pro_integrity.data(), integ_ptr, pro_integrity.size());
+    std::memcpy(pro_watchdog.data(), watch_ptr, pro_watchdog.size());
+    std::memcpy(pro_section.data(), section_ptr, pro_section.size());
     prologues_ready.store(true);
 }
 
@@ -2019,9 +2031,17 @@ bool prologues_ok()
     const auto req_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&KeyAuth::api::req));
     const auto verify_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&VerifyPayload));
     const auto check_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&checkInit));
+    const auto error_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&error));
+    const auto integ_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&integrity_check));
+    const auto watch_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&integrity_watchdog));
+    const auto section_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&check_section_integrity));
     return std::memcmp(pro_req.data(), req_ptr, pro_req.size()) == 0 &&
         std::memcmp(pro_verify.data(), verify_ptr, pro_verify.size()) == 0 &&
-        std::memcmp(pro_checkinit.data(), check_ptr, pro_checkinit.size()) == 0;
+        std::memcmp(pro_checkinit.data(), check_ptr, pro_checkinit.size()) == 0 &&
+        std::memcmp(pro_error.data(), error_ptr, pro_error.size()) == 0 &&
+        std::memcmp(pro_integrity.data(), integ_ptr, pro_integrity.size()) == 0 &&
+        std::memcmp(pro_watchdog.data(), watch_ptr, pro_watchdog.size()) == 0 &&
+        std::memcmp(pro_section.data(), section_ptr, pro_section.size()) == 0;
 }
 
 bool func_region_ok(const void* addr)
@@ -2434,7 +2454,11 @@ void checkInit() {
     }
     if (!func_region_ok(reinterpret_cast<const void*>(&KeyAuth::api::req)) ||
         !func_region_ok(reinterpret_cast<const void*>(&VerifyPayload)) ||
-        !func_region_ok(reinterpret_cast<const void*>(&checkInit))) {
+        !func_region_ok(reinterpret_cast<const void*>(&checkInit)) ||
+        !func_region_ok(reinterpret_cast<const void*>(&error)) ||
+        !func_region_ok(reinterpret_cast<const void*>(&integrity_check)) ||
+        !func_region_ok(reinterpret_cast<const void*>(&integrity_watchdog)) ||
+        !func_region_ok(reinterpret_cast<const void*>(&check_section_integrity))) {
         error(XorStr("function region check failed, possible hook detected."));
     }
     integrity_check();
@@ -2474,7 +2498,11 @@ void integrity_watchdog() {
         }
         if (!func_region_ok(reinterpret_cast<const void*>(&KeyAuth::api::req)) ||
             !func_region_ok(reinterpret_cast<const void*>(&VerifyPayload)) ||
-            !func_region_ok(reinterpret_cast<const void*>(&checkInit))) {
+            !func_region_ok(reinterpret_cast<const void*>(&checkInit)) ||
+            !func_region_ok(reinterpret_cast<const void*>(&error)) ||
+            !func_region_ok(reinterpret_cast<const void*>(&integrity_check)) ||
+            !func_region_ok(reinterpret_cast<const void*>(&integrity_watchdog)) ||
+            !func_region_ok(reinterpret_cast<const void*>(&check_section_integrity))) {
             error(XorStr("function region check failed, possible hook detected."));
         }
         if (check_section_integrity(XorStr(".text").c_str(), false)) {
