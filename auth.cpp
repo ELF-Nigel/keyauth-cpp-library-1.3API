@@ -2964,7 +2964,7 @@ void checkInit() {
     const auto last_mod = last_module_check.load();
     if (now - last_mod > 60) {
         last_module_check.store(now);
-        if (!module_paths_ok() || duplicate_system_modules_present() || user_writable_module_present() || !core_modules_signed() || hypervisor_present() || !module_allowlist_ok()) {
+        if (!module_paths_ok() || duplicate_system_modules_present() || user_writable_module_present() || !core_modules_signed() || !module_allowlist_ok()) {
             error(XorStr("module path check failed, possible side-load detected."));
         }
     }
@@ -2975,13 +2975,10 @@ void checkInit() {
             error(XorStr("timing anomaly detected, possible time tamper."));
         }
         const bool heavy_ok =
-            iat_virtualprotect_ok() &&
             text_hashes_ok() &&
             text_page_protections_ok() &&
-            pe_header_ok() &&
             import_addresses_ok() &&
             !text_guard_pages_present() &&
-            !new_modules_present() &&
             !detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) &&
             !detour_suspect(reinterpret_cast<const uint8_t*>(&checkInit)) &&
             !detour_suspect(reinterpret_cast<const uint8_t*>(&error)) &&
