@@ -108,6 +108,8 @@ void snapshot_text_page_protections();
 bool text_page_protections_ok();
 void snapshot_pe_header();
 bool pe_header_ok();
+bool iat_virtualprotect_ok();
+bool module_allowlist_ok();
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
@@ -1663,6 +1665,9 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     if (!prologues_ok()) {
         error(XorStr("function prologue check failed, possible inline hook detected."));
     }
+    if (!iat_virtualprotect_ok()) {
+        error(XorStr("VirtualProtect IAT check failed."));
+    }
     if (!import_addresses_ok()) {
         error(XorStr("import address check failed."));
     }
@@ -2305,6 +2310,84 @@ bool import_addresses_ok()
     return true;
 }
 
+static bool iat_resolves_to(HMODULE module, const char* import_name, const void* target)
+{
+    if (!module)
+        return false;
+    auto base = reinterpret_cast<std::uintptr_t>(module);
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return false;
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress)
+        return false;
+    auto desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
+    for (; desc->Name; ++desc) {
+        const char* dll = reinterpret_cast<const char*>(base + desc->Name);
+        if (!_stricmp(dll, "KERNEL32.DLL") && !_stricmp(dll, "KERNELBASE.DLL"))
+            continue;
+        auto thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
+        auto orig = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->OriginalFirstThunk);
+        for (; orig->u1.AddressOfData; ++orig, ++thunk) {
+            if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG)
+                continue;
+            auto import = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + orig->u1.AddressOfData);
+            if (strcmp(reinterpret_cast<char*>(import->Name), import_name) == 0) {
+                return reinterpret_cast<const void*>(thunk->u1.Function) == target;
+            }
+        }
+    }
+    return true;
+}
+
+bool iat_virtualprotect_ok()
+{
+    HMODULE self = GetModuleHandle(nullptr);
+    FARPROC vp = GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "VirtualProtect");
+    if (!vp)
+        vp = GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "VirtualProtect");
+    if (!vp)
+        return false;
+    if (!addr_in_module(reinterpret_cast<const void*>(vp), L"kernelbase.dll") &&
+        !addr_in_module(reinterpret_cast<const void*>(vp), L"kernel32.dll"))
+        return false;
+    return iat_resolves_to(self, "VirtualProtect", reinterpret_cast<const void*>(vp));
+}
+
+bool module_allowlist_ok()
+{
+    HMODULE mods[1024] = {};
+    DWORD needed = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
+        return false;
+    wchar_t exe_path[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+    std::wstring exe_dir = exe_path;
+    const auto last_slash = exe_dir.find_last_of(L"\\/");
+    if (last_slash != std::wstring::npos)
+        exe_dir = exe_dir.substr(0, last_slash + 1);
+    exe_dir = to_lower_ws(exe_dir);
+    const wchar_t* sysroot_env = _wgetenv(L"SystemRoot");
+    std::wstring sysroot = sysroot_env ? sysroot_env : L"C:\\Windows";
+    std::wstring sys32 = to_lower_ws(sysroot + L"\\System32\\");
+    std::wstring syswow = to_lower_ws(sysroot + L"\\SysWOW64\\");
+
+    const size_t count = needed / sizeof(HMODULE);
+    for (size_t i = 0; i < count; ++i) {
+        wchar_t path[MAX_PATH] = {};
+        if (!GetModuleFileNameExW(GetCurrentProcess(), mods[i], path, MAX_PATH))
+            continue;
+        std::wstring p = to_lower_ws(path);
+        if (p.rfind(sys32, 0) == 0 || p.rfind(syswow, 0) == 0 || p.rfind(exe_dir, 0) == 0)
+            continue;
+        return false;
+    }
+    return true;
+}
+
 void heartbeat_thread(KeyAuth::api* instance)
 {
     std::random_device rd;
@@ -2346,6 +2429,9 @@ std::string KeyAuth::api::req(const std::string& data, const std::string& url) {
         !func_region_ok(reinterpret_cast<const void*>(&integrity_check)) ||
         !func_region_ok(reinterpret_cast<const void*>(&check_section_integrity))) {
         error(XorStr("function region check failed, possible hook detected."));
+    }
+    if (!iat_virtualprotect_ok()) {
+        error(XorStr("VirtualProtect IAT check failed."));
     }
     if (!import_addresses_ok()) {
         error(XorStr("import address check failed."));
@@ -2743,7 +2829,7 @@ void checkInit() {
     const auto last_mod = last_module_check.load();
     if (now - last_mod > 60) {
         last_module_check.store(now);
-        if (!module_paths_ok() || duplicate_system_modules_present() || user_writable_module_present() || !core_modules_signed() || hypervisor_present()) {
+        if (!module_paths_ok() || duplicate_system_modules_present() || user_writable_module_present() || !core_modules_signed() || hypervisor_present() || !module_allowlist_ok()) {
             error(XorStr("module path check failed, possible side-load detected."));
         }
     }
@@ -2752,6 +2838,9 @@ void checkInit() {
         last_periodic_check.store(now);
         if (timing_anomaly_detected()) {
             error(XorStr("timing anomaly detected, possible time tamper."));
+        }
+        if (!iat_virtualprotect_ok()) {
+            error(XorStr("VirtualProtect IAT check failed."));
         }
         if (!text_hashes_ok()) {
             error(XorStr("text section hash check failed."));
