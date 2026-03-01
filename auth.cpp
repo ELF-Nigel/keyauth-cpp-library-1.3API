@@ -107,6 +107,7 @@ std::atomic<bool> LoggedIn(false);
 std::atomic<long long> last_integrity_check{ 0 };
 std::atomic<int> integrity_fail_streak{ 0 };
 std::atomic<long long> last_module_check{ 0 };
+std::atomic<long long> last_periodic_check{ 0 };
 std::atomic<bool> prologues_ready{ false };
 std::array<uint8_t, 16> pro_req{};
 std::array<uint8_t, 16> pro_verify{};
@@ -2440,6 +2441,29 @@ void checkInit() {
         last_module_check.store(now);
         if (!module_paths_ok() || duplicate_system_modules_present() || user_writable_module_present() || !core_modules_signed() || hypervisor_present()) {
             error(XorStr("module path check failed, possible side-load detected."));
+        }
+    }
+    const auto last_periodic = last_periodic_check.load();
+    if (now - last_periodic > 30) {
+        last_periodic_check.store(now);
+        if (!prologues_ok()) {
+            error(XorStr("function prologue check failed, possible inline hook detected."));
+        }
+        if (!func_region_ok(reinterpret_cast<const void*>(&KeyAuth::api::req)) ||
+            !func_region_ok(reinterpret_cast<const void*>(&VerifyPayload)) ||
+            !func_region_ok(reinterpret_cast<const void*>(&checkInit)) ||
+            !func_region_ok(reinterpret_cast<const void*>(&error)) ||
+            !func_region_ok(reinterpret_cast<const void*>(&integrity_check)) ||
+            !func_region_ok(reinterpret_cast<const void*>(&check_section_integrity))) {
+            error(XorStr("function region check failed, possible hook detected."));
+        }
+        if (check_section_integrity(XorStr(".text").c_str(), false)) {
+            const int streak = integrity_fail_streak.fetch_add(1) + 1;
+            if (streak >= 2) {
+                error(XorStr("check_section_integrity() failed, don't tamper with the program."));
+            }
+        } else {
+            integrity_fail_streak.store(0);
         }
     }
     if (!prologues_ok()) {
