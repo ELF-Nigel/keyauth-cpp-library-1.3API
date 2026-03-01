@@ -72,6 +72,26 @@ What runs automatically:
 4. **Timing anomaly checks** to detect time tamper.
 5. **Session heartbeat** after successful login/license/upgrade/web login.
 
+## **Security Overview**
+This SDK includes lightweight, client-side defenses that raise the cost of common bypass techniques while keeping normal integrations simple.
+
+What it protects against:
+1. **Inline patching/NOPs**: prologue snapshots and detour heuristics catch modified function entry points.
+2. **Code tamper**: `.text` hashing and page‑protection checks detect modified code pages.
+3. **API redirection**: hosts‑file checks flag local DNS overrides of the API host.
+4. **Time spoofing**: timing anomaly checks reduce abuse of expired keys by system clock changes.
+5. **Tampered system DLLs**: core module signature checks reject patched or unsigned system libraries.
+
+Benefits:
+1. **Fail‑closed behavior**: when a check fails, requests are blocked before the API call.
+2. **Low integration cost**: no additional calls are required beyond `init()` and a normal login/license flow.
+3. **Reduced false positives**: checks are limited to core modules and conservative tamper signals.
+
+Design notes:
+1. These are **client‑side** protections. They complement — not replace — server‑side session validation.
+2. If you modify or strip checks, you reduce protection. Keep the SDK updated to inherit fixes.
+3. Optional hardening ideas are listed below for advanced users who accept higher false‑positive risk.
+
 How to keep security enabled:
 1. Always call `KeyAuthApp.init()` once before any other API call.
 2. Do not remove the built-in checks or tamper with the library internals.
