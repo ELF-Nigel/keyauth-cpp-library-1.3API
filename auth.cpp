@@ -147,24 +147,24 @@ std::atomic<int> heavy_fail_streak{ 0 };
 std::atomic<bool> module_baseline_ready{ false };
 std::vector<std::wstring> module_baseline;
 
-static void secure_zero(std::string& value)
+static inline void secure_zero(std::string& value) noexcept
 {
-    if (value.empty())
-        return;
-    SecureZeroMemory(value.data(), value.size());
-    value.clear();
-    value.shrink_to_fit();
+    if (!value.empty()) {
+        SecureZeroMemory(value.data(), value.size());
+        value.clear();
+        value.shrink_to_fit();
+    }
 }
 
-static void securewipe(std::string& value)
+static inline void securewipe(std::string& value) noexcept
 {
     secure_zero(value);
 }
 
-struct ScopeWipe {
+struct ScopeWipe final {
     std::string* value;
-    explicit ScopeWipe(std::string& v) : value(&v) {}
-    ~ScopeWipe() { securewipe(*value); }
+    explicit ScopeWipe(std::string& v) noexcept : value(&v) {}
+    ~ScopeWipe() noexcept { securewipe(*value); }
 };
 
 void KeyAuth::api::init()
