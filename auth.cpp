@@ -104,6 +104,10 @@ void snapshot_text_hashes();
 bool text_hashes_ok();
 bool detour_suspect(const uint8_t* p);
 bool import_addresses_ok();
+void snapshot_text_page_protections();
+bool text_page_protections_ok();
+void snapshot_pe_header();
+bool pe_header_ok();
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
@@ -127,6 +131,10 @@ std::array<uint8_t, 16> pro_section{};
 std::atomic<bool> text_hashes_ready{ false };
 struct TextHash { size_t offset; size_t len; uint32_t hash; };
 std::vector<TextHash> text_hashes;
+std::atomic<bool> text_prot_ready{ false };
+std::vector<std::pair<std::uintptr_t, DWORD>> text_protections;
+std::atomic<bool> pe_header_ready{ false };
+uint32_t pe_header_hash = 0;
 
 void KeyAuth::api::init()
 {
@@ -1661,6 +1669,12 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     if (!text_hashes_ok()) {
         error(XorStr("text section hash check failed."));
     }
+    if (!text_page_protections_ok()) {
+        error(XorStr("text page protection check failed."));
+    }
+    if (!pe_header_ok()) {
+        error(XorStr("pe header check failed."));
+    }
     if (detour_suspect(reinterpret_cast<const uint8_t*>(&KeyAuth::api::req)) ||
         detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) ||
         detour_suspect(reinterpret_cast<const uint8_t*>(&checkInit)) ||
@@ -2046,6 +2060,8 @@ void snapshot_prologues()
     std::memcpy(pro_section.data(), section_ptr, pro_section.size());
     prologues_ready.store(true);
     snapshot_text_hashes();
+    snapshot_text_page_protections();
+    snapshot_pe_header();
 }
 
 bool prologues_ok()
@@ -2166,6 +2182,85 @@ bool text_hashes_ok()
     return true;
 }
 
+void snapshot_text_page_protections()
+{
+    if (text_prot_ready.load())
+        return;
+    std::uintptr_t base = 0;
+    size_t size = 0;
+    if (!get_text_section_info(base, size))
+        return;
+    text_protections.clear();
+    const size_t page = 0x1000;
+    for (size_t off = 0; off < size; off += page) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<const void*>(base + off), &mbi, sizeof(mbi)) == 0)
+            continue;
+        text_protections.emplace_back(reinterpret_cast<std::uintptr_t>(mbi.BaseAddress), mbi.Protect);
+    }
+    text_prot_ready.store(true);
+}
+
+bool text_page_protections_ok()
+{
+    if (!text_prot_ready.load())
+        return true;
+    for (const auto& entry : text_protections) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<const void*>(entry.first), &mbi, sizeof(mbi)) == 0)
+            return false;
+        const DWORD prot = mbi.Protect;
+        if (prot != entry.second)
+            return false;
+        const bool exec = (prot & PAGE_EXECUTE) || (prot & PAGE_EXECUTE_READ) || (prot & PAGE_EXECUTE_READWRITE) || (prot & PAGE_EXECUTE_WRITECOPY);
+        const bool write = (prot & PAGE_READWRITE) || (prot & PAGE_EXECUTE_READWRITE) || (prot & PAGE_WRITECOPY) || (prot & PAGE_EXECUTE_WRITECOPY);
+        if (!exec || write)
+            return false;
+    }
+    return true;
+}
+
+void snapshot_pe_header()
+{
+    if (pe_header_ready.load())
+        return;
+    const auto hmodule = GetModuleHandle(nullptr);
+    if (!hmodule)
+        return;
+    const auto base = reinterpret_cast<std::uintptr_t>(hmodule);
+    const auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return;
+    const auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return;
+    const size_t header_size = nt->OptionalHeader.SizeOfHeaders;
+    if (header_size == 0 || header_size > 0x4000)
+        return;
+    pe_header_hash = fnv1a(reinterpret_cast<const uint8_t*>(base), header_size);
+    pe_header_ready.store(true);
+}
+
+bool pe_header_ok()
+{
+    if (!pe_header_ready.load())
+        return true;
+    const auto hmodule = GetModuleHandle(nullptr);
+    if (!hmodule)
+        return true;
+    const auto base = reinterpret_cast<std::uintptr_t>(hmodule);
+    const auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    const auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return false;
+    const size_t header_size = nt->OptionalHeader.SizeOfHeaders;
+    if (header_size == 0 || header_size > 0x4000)
+        return false;
+    return fnv1a(reinterpret_cast<const uint8_t*>(base), header_size) == pe_header_hash;
+}
+
 bool detour_suspect(const uint8_t* p)
 {
     if (!p)
@@ -2257,6 +2352,12 @@ std::string KeyAuth::api::req(const std::string& data, const std::string& url) {
     }
     if (!text_hashes_ok()) {
         error(XorStr("text section hash check failed."));
+    }
+    if (!text_page_protections_ok()) {
+        error(XorStr("text page protection check failed."));
+    }
+    if (!pe_header_ok()) {
+        error(XorStr("pe header check failed."));
     }
     if (detour_suspect(reinterpret_cast<const uint8_t*>(&KeyAuth::api::req)) ||
         detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) ||
@@ -2654,6 +2755,12 @@ void checkInit() {
         }
         if (!text_hashes_ok()) {
             error(XorStr("text section hash check failed."));
+        }
+        if (!text_page_protections_ok()) {
+            error(XorStr("text page protection check failed."));
+        }
+        if (!pe_header_ok()) {
+            error(XorStr("pe header check failed."));
         }
         if (!import_addresses_ok()) {
             error(XorStr("import address check failed."));
