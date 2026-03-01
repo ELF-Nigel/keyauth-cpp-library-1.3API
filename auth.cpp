@@ -2599,7 +2599,6 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
     curl_easy_setopt(curl, CURLOPT_CERTINFO, 1L);
     curl_easy_setopt(curl, CURLOPT_NOPROXY, XorStr("keyauth.win").c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(data.size()));
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &to_return);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
