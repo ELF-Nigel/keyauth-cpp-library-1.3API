@@ -2325,22 +2325,21 @@ bool import_addresses_ok()
     return true;
 }
 
-static bool iat_resolves_to(HMODULE module, const char* import_name, const void* target)
+static bool iat_resolves_to(HMODULE module, const char* import_name, const void* target, bool& found)
 {
     if (!module)
-        return false;
+        return true;
     auto base = reinterpret_cast<std::uintptr_t>(module);
     auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-        return false;
+        return true;
     auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE)
-        return false;
+        return true;
     const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (!dir.VirtualAddress)
-        return false;
+        return true;
     auto desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
-    bool found = false;
     for (; desc->Name; ++desc) {
         const char* dll = reinterpret_cast<const char*>(base + desc->Name);
         if (_stricmp(dll, "KERNEL32.DLL") != 0 && _stricmp(dll, "KERNELBASE.DLL") != 0)
@@ -2359,7 +2358,7 @@ static bool iat_resolves_to(HMODULE module, const char* import_name, const void*
             }
         }
     }
-    return !found; // if not imported (e.g., static link), do not fail. -nigel
+    return true;
 }
 
 bool iat_virtualprotect_ok()
@@ -2373,7 +2372,11 @@ bool iat_virtualprotect_ok()
     if (!addr_in_module(reinterpret_cast<const void*>(vp), L"kernelbase.dll") &&
         !addr_in_module(reinterpret_cast<const void*>(vp), L"kernel32.dll"))
         return false;
-    return iat_resolves_to(self, "VirtualProtect", reinterpret_cast<const void*>(vp));
+    bool found = false;
+    const bool match = iat_resolves_to(self, "VirtualProtect", reinterpret_cast<const void*>(vp), found);
+    if (!found)
+        return true; // allow when not imported
+    return match;
 }
 
 bool module_allowlist_ok()
