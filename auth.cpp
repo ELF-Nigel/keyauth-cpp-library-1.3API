@@ -35,12 +35,16 @@
 #pragma comment(lib, "rpcrt4.lib")
 #pragma comment(lib, "httpapi.lib")
 #pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "wintrust.lib")
 
 #include <cstdio>
 #include <iostream>
 #include <memory>
 #include <algorithm>
 #include <psapi.h>
+#include <wintrust.h>
+#include <softpub.h>
+#include <cwctype>
 #include <stdexcept>
 #include <string>
 #include <array>
@@ -83,6 +87,9 @@ std::string extract_host(const std::string& url);
 bool hosts_override_present(const std::string& host);
 bool module_paths_ok();
 bool duplicate_system_modules_present();
+bool user_writable_module_present();
+bool module_has_rwx_section(HMODULE mod);
+bool core_modules_signed();
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
@@ -1776,6 +1783,72 @@ static std::wstring to_lower_ws(std::wstring value)
     return value;
 }
 
+static bool path_has_any(const std::wstring& p, const std::initializer_list<std::wstring>& needles)
+{
+    for (const auto& n : needles) {
+        if (p.find(n) != std::wstring::npos)
+            return true;
+    }
+    return false;
+}
+
+bool module_has_rwx_section(HMODULE mod)
+{
+    if (!mod)
+        return false;
+    auto base = reinterpret_cast<std::uintptr_t>(mod);
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return false;
+    auto section = IMAGE_FIRST_SECTION(nt);
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        const auto ch = section->Characteristics;
+        if ((ch & IMAGE_SCN_MEM_EXECUTE) && (ch & IMAGE_SCN_MEM_WRITE))
+            return true;
+    }
+    return false;
+}
+
+static bool verify_signature(const std::wstring& path)
+{
+    WINTRUST_FILE_INFO file_info{};
+    file_info.cbStruct = sizeof(file_info);
+    file_info.pcwszFilePath = path.c_str();
+
+    WINTRUST_DATA trust_data{};
+    trust_data.cbStruct = sizeof(trust_data);
+    trust_data.dwUIChoice = WTD_UI_NONE;
+    trust_data.fdwRevocationChecks = WTD_REVOKE_NONE;
+    trust_data.dwUnionChoice = WTD_CHOICE_FILE;
+    trust_data.pFile = &file_info;
+    trust_data.dwStateAction = WTD_STATEACTION_IGNORE;
+
+    GUID policy = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    LONG status = WinVerifyTrust(nullptr, &policy, &trust_data);
+    return status == ERROR_SUCCESS;
+}
+
+bool core_modules_signed()
+{
+    const wchar_t* kModules[] = { L"ntdll.dll", L"kernel32.dll", L"kernelbase.dll", L"user32.dll" };
+    for (const auto* name : kModules) {
+        HMODULE mod = GetModuleHandleW(name);
+        if (!mod)
+            return false;
+        wchar_t path[MAX_PATH] = {};
+        if (!GetModuleFileNameW(mod, path, MAX_PATH))
+            return false;
+        if (!verify_signature(path))
+            return false;
+        if (module_has_rwx_section(mod))
+            return false;
+    }
+    return true;
+}
+
 bool module_paths_ok()
 {
     const wchar_t* kModules[] = { L"ntdll.dll", L"kernel32.dll", L"kernelbase.dll", L"user32.dll" };
@@ -1829,6 +1902,36 @@ bool duplicate_system_modules_present()
         if (!is_target)
             continue;
         if (p.rfind(sys32, 0) != 0 && p.rfind(syswow, 0) != 0)
+            return true;
+    }
+    return false;
+}
+
+bool user_writable_module_present()
+{
+    HMODULE mods[1024] = {};
+    DWORD needed = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
+        return false;
+
+    wchar_t exe_path[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+    std::wstring exe_dir = exe_path;
+    const auto last_slash = exe_dir.find_last_of(L"\\/");
+    if (last_slash != std::wstring::npos)
+        exe_dir = exe_dir.substr(0, last_slash + 1);
+    exe_dir = to_lower_ws(exe_dir);
+
+    const size_t count = needed / sizeof(HMODULE);
+    for (size_t i = 0; i < count; ++i) {
+        wchar_t path[MAX_PATH] = {};
+        if (!GetModuleFileNameExW(GetCurrentProcess(), mods[i], path, MAX_PATH))
+            continue;
+        std::wstring p = to_lower_ws(path);
+        if (p.rfind(exe_dir, 0) == 0)
+            continue;
+
+        if (path_has_any(p, { L"\\temp\\", L"\\appdata\\local\\temp\\", L"\\downloads\\" }))
             return true;
     }
     return false;
@@ -2220,7 +2323,7 @@ void checkInit() {
     const auto last_mod = last_module_check.load();
     if (now - last_mod > 60) {
         last_module_check.store(now);
-        if (!module_paths_ok() || duplicate_system_modules_present()) {
+        if (!module_paths_ok() || duplicate_system_modules_present() || user_writable_module_present() || !core_modules_signed()) {
             error(XorStr("module path check failed, possible side-load detected."));
         }
     }
@@ -2252,7 +2355,7 @@ void integrity_watchdog() {
         const auto last_mod = last_module_check.load();
         if (now - last_mod > 120) {
             last_module_check.store(now);
-            if (!module_paths_ok() || duplicate_system_modules_present()) {
+            if (!module_paths_ok() || duplicate_system_modules_present() || user_writable_module_present() || !core_modules_signed()) {
                 error(XorStr("module path check failed, possible side-load detected."));
             }
         }
