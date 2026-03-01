@@ -319,6 +319,9 @@ size_t header_callback(char* buffer, size_t size, size_t nitems, void* userdata)
 void KeyAuth::api::login(std::string username, std::string password, std::string code)
 {
     checkInit();
+    ScopeWipe wipe_user(username);
+    ScopeWipe wipe_pass(password);
+    ScopeWipe wipe_code(code);
 
     std::string hwid = utils::get_hwid();
     auto data =
@@ -395,6 +398,7 @@ void KeyAuth::api::login(std::string username, std::string password, std::string
 void KeyAuth::api::chatget(std::string channel)
 {
     checkInit();
+    ScopeWipe wipe_channel(channel);
 
     auto data =
         XorStr("type=chatget") +
@@ -411,6 +415,8 @@ void KeyAuth::api::chatget(std::string channel)
 bool KeyAuth::api::chatsend(std::string message, std::string channel)
 {
     checkInit();
+    ScopeWipe wipe_message(message);
+    ScopeWipe wipe_channel(channel);
 
     auto data =
         XorStr("type=chatsend") +
@@ -429,6 +435,7 @@ bool KeyAuth::api::chatsend(std::string message, std::string channel)
 void KeyAuth::api::changeUsername(std::string newusername)
 {
     checkInit();
+    ScopeWipe wipe_user(newusername);
 
     auto data =
         XorStr("type=changeUsername") +
@@ -902,6 +909,7 @@ void KeyAuth::api::web_login()
 void KeyAuth::api::button(std::string button)
 {
     checkInit();
+    ScopeWipe wipe_button(button);
 
     // from https://perpetualprogrammers.wordpress.com/2016/05/22/the-http-server-api/
 
@@ -1017,6 +1025,10 @@ void KeyAuth::api::button(std::string button)
 
 void KeyAuth::api::regstr(std::string username, std::string password, std::string key, std::string email) {
     checkInit();
+    ScopeWipe wipe_user(username);
+    ScopeWipe wipe_pass(password);
+    ScopeWipe wipe_key(key);
+    ScopeWipe wipe_email(email);
 
     std::string hwid = utils::get_hwid();
     auto data =
@@ -1090,6 +1102,8 @@ void KeyAuth::api::regstr(std::string username, std::string password, std::strin
 
 void KeyAuth::api::upgrade(std::string username, std::string key) {
     checkInit();
+    ScopeWipe wipe_user(username);
+    ScopeWipe wipe_key(key);
 
     auto data =
         XorStr("type=upgrade") +
@@ -1146,6 +1160,8 @@ std::string generate_random_number() {
 
 void KeyAuth::api::license(std::string key, std::string code) {
     checkInit();
+    ScopeWipe wipe_key(key);
+    ScopeWipe wipe_code(code);
 
     std::string hwid = utils::get_hwid();
     auto data =
@@ -1215,6 +1231,8 @@ void KeyAuth::api::license(std::string key, std::string code) {
 
 void KeyAuth::api::setvar(std::string var, std::string vardata) {
     checkInit();
+    ScopeWipe wipe_var(var);
+    ScopeWipe wipe_data(vardata);
 
     auto data =
         XorStr("type=setvar") +
@@ -1230,6 +1248,7 @@ void KeyAuth::api::setvar(std::string var, std::string vardata) {
 
 std::string KeyAuth::api::getvar(std::string var) {
     checkInit();
+    ScopeWipe wipe_var(var);
 
     auto data =
         XorStr("type=getvar") +
@@ -1270,6 +1289,7 @@ std::string KeyAuth::api::getvar(std::string var) {
 
 void KeyAuth::api::ban(std::string reason) {
     checkInit();
+    ScopeWipe wipe_reason(reason);
 
     auto data =
         XorStr("type=ban") +
@@ -1432,6 +1452,7 @@ std::string KeyAuth::api::var(std::string varid) {
 
 void KeyAuth::api::log(std::string message) {
     checkInit();
+    ScopeWipe wipe_message(message);
 
     char acUserName[100];
     DWORD nUserName = sizeof(acUserName);
@@ -1451,6 +1472,7 @@ void KeyAuth::api::log(std::string message) {
 
 std::vector<unsigned char> KeyAuth::api::download(std::string fileid) {
     checkInit();
+    ScopeWipe wipe_fileid(fileid);
 
     auto to_uc_vector = [](std::string value) {
         return std::vector<unsigned char>(value.data(), value.data() + value.length() );
@@ -1481,6 +1503,10 @@ std::vector<unsigned char> KeyAuth::api::download(std::string fileid) {
 std::string KeyAuth::api::webhook(std::string id, std::string params, std::string body, std::string contenttype)
 {
     checkInit();
+    ScopeWipe wipe_id(id);
+    ScopeWipe wipe_params(params);
+    ScopeWipe wipe_body(body);
+    ScopeWipe wipe_type(contenttype);
 
     CURL *curl = curl_easy_init();
     auto data =
@@ -1620,6 +1646,8 @@ void KeyAuth::api::fetchstats()
 void KeyAuth::api::forgot(std::string username, std::string email)
 {
     checkInit();
+    ScopeWipe wipe_user(username);
+    ScopeWipe wipe_email(email);
 
     auto data =
         XorStr("type=forgot") +
@@ -2005,6 +2033,12 @@ static void secure_zero(std::string& value)
     value.clear();
     value.shrink_to_fit();
 }
+
+struct ScopeWipe {
+    std::string* value;
+    explicit ScopeWipe(std::string& v) : value(&v) {}
+    ~ScopeWipe() { secure_zero(*value); }
+};
 
 static std::wstring get_system_dir()
 {
