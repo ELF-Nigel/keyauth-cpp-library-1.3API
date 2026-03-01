@@ -82,6 +82,16 @@ How to verify it is running:
 1. Use the library normally — the checks are automatic.
 2. If a check fails, the library will fail closed with an error message.
 
+## **Security Troubleshooting**
+If you see security failures, common causes include:
+1. **DLL injection / overlays**: third‑party overlays or injectors can trip module allowlists.
+2. **Modified system DLLs**: non‑Microsoft versions or patched DLLs will be rejected.
+3. **Time tampering**: manual clock changes or large time skew can trigger timing checks.
+4. **VMs/Hypervisors**: running inside a VM can trigger hypervisor detection.
+5. **Patched binaries**: inline hooks/NOP patches or modified `.text` will fail integrity checks.
+
+If you need to allow specific overlays or tools, add them to an allowlist in the code and rebuild the library.
+
 Helpful references (copy and paste into your browser):
 ```
 https://github.com/KeyAuth/KeyAuth-CPP-Example
