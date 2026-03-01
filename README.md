@@ -108,7 +108,7 @@ These are intentionally **not** enabled in the library to avoid false positives,
 2. **Module allowlists**: require a strict set of loaded modules; this breaks overlays and many legitimate plugins.
 3. **System module path checks**: enforce System32/SysWOW64-only paths; can fail on custom Windows installs.
 4. **Hypervisor detection**: block VMs; useful for niche threat models but unfriendly to legit users.
-5. **VirtualProtect IAT validation**: detect IAT hooks; can false-positive in some environments.
+5. **IAT validation**: detect import-table hooks for any imported API; can false-positive in some environments.
 
 ## **Security Troubleshooting**
 If you see security failures, common causes include:
