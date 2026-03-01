@@ -45,6 +45,7 @@
 #include <wintrust.h>
 #include <softpub.h>
 #include <cwctype>
+#include <intrin.h>
 #include <stdexcept>
 #include <string>
 #include <array>
@@ -90,6 +91,7 @@ bool duplicate_system_modules_present();
 bool user_writable_module_present();
 bool module_has_rwx_section(HMODULE mod);
 bool core_modules_signed();
+bool hypervisor_present();
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
@@ -1937,6 +1939,56 @@ bool user_writable_module_present()
     return false;
 }
 
+static bool reg_key_exists(HKEY root, const wchar_t* path)
+{
+    HKEY h = nullptr;
+    const LONG res = RegOpenKeyExW(root, path, 0, KEY_READ, &h);
+    if (res == ERROR_SUCCESS) {
+        RegCloseKey(h);
+        return true;
+    }
+    return false;
+}
+
+static bool file_exists(const std::wstring& path)
+{
+    const DWORD attr = GetFileAttributesW(path.c_str());
+    return (attr != INVALID_FILE_ATTRIBUTES) && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+bool hypervisor_present()
+{
+    int cpu_info[4] = {};
+    __cpuid(cpu_info, 1);
+    const bool hv_bit = (cpu_info[2] & (1 << 31)) != 0;
+    if (hv_bit) {
+        return true;
+    }
+
+    // registry artifacts (conservative)
+    if (reg_key_exists(HKEY_LOCAL_MACHINE, L"HARDWARE\\ACPI\\DSDT\\VBOX__") ||
+        reg_key_exists(HKEY_LOCAL_MACHINE, L"HARDWARE\\ACPI\\DSDT\\VMWARE") ||
+        reg_key_exists(HKEY_LOCAL_MACHINE, L"HARDWARE\\ACPI\\DSDT\\XEN") ||
+        reg_key_exists(HKEY_LOCAL_MACHINE, L"SOFTWARE\\VMware, Inc.\\VMware Tools") ||
+        reg_key_exists(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Oracle\\VirtualBox Guest Additions")) {
+        return true;
+    }
+
+    // file artifacts (drivers/tools)
+    if (file_exists(L"C:\\Windows\\System32\\drivers\\VBoxGuest.sys") ||
+        file_exists(L"C:\\Windows\\System32\\drivers\\VBoxMouse.sys") ||
+        file_exists(L"C:\\Windows\\System32\\drivers\\VBoxSF.sys") ||
+        file_exists(L"C:\\Windows\\System32\\drivers\\VBoxVideo.sys") ||
+        file_exists(L"C:\\Windows\\System32\\drivers\\vmhgfs.sys") ||
+        file_exists(L"C:\\Windows\\System32\\drivers\\vmmouse.sys") ||
+        file_exists(L"C:\\Windows\\System32\\drivers\\vm3dmp.sys") ||
+        file_exists(L"C:\\Windows\\System32\\drivers\\xen.sys")) {
+        return true;
+    }
+
+    return false;
+}
+
 void KeyAuth::api::setDebug(bool value) {
     KeyAuth::api::debug = value;
 }
@@ -2323,7 +2375,7 @@ void checkInit() {
     const auto last_mod = last_module_check.load();
     if (now - last_mod > 60) {
         last_module_check.store(now);
-        if (!module_paths_ok() || duplicate_system_modules_present() || user_writable_module_present() || !core_modules_signed()) {
+        if (!module_paths_ok() || duplicate_system_modules_present() || user_writable_module_present() || !core_modules_signed() || hypervisor_present()) {
             error(XorStr("module path check failed, possible side-load detected."));
         }
     }
@@ -2355,7 +2407,7 @@ void integrity_watchdog() {
         const auto last_mod = last_module_check.load();
         if (now - last_mod > 120) {
             last_module_check.store(now);
-            if (!module_paths_ok() || duplicate_system_modules_present() || user_writable_module_present() || !core_modules_signed()) {
+            if (!module_paths_ok() || duplicate_system_modules_present() || user_writable_module_present() || !core_modules_signed() || hypervisor_present()) {
                 error(XorStr("module path check failed, possible side-load detected."));
             }
         }
