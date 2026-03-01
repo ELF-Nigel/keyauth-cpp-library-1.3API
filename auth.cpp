@@ -1666,26 +1666,6 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     if (!prologues_ok()) {
         error(XorStr("function prologue check failed, possible inline hook detected."));
     }
-    if (!iat_virtualprotect_ok()) {
-        error(XorStr("VirtualProtect IAT check failed."));
-    }
-    if (!import_addresses_ok()) {
-        error(XorStr("import address check failed."));
-    }
-    if (!text_hashes_ok()) {
-        error(XorStr("text section hash check failed."));
-    }
-    if (!text_page_protections_ok()) {
-        error(XorStr("text page protection check failed."));
-    }
-    if (!pe_header_ok()) {
-        error(XorStr("pe header check failed."));
-    }
-    if (detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) ||
-        detour_suspect(reinterpret_cast<const uint8_t*>(&checkInit)) ||
-        detour_suspect(reinterpret_cast<const uint8_t*>(&error))) {
-        error(XorStr("detour pattern detected."));
-    }
     integrity_check();
     long long unix_timestamp = 0;
     try {
@@ -2457,26 +2437,6 @@ std::string KeyAuth::api::req(const std::string& data, const std::string& url) {
         !func_region_ok(reinterpret_cast<const void*>(&check_section_integrity))) {
         error(XorStr("function region check failed, possible hook detected."));
     }
-    if (!iat_virtualprotect_ok()) {
-        error(XorStr("VirtualProtect IAT check failed."));
-    }
-    if (!import_addresses_ok()) {
-        error(XorStr("import address check failed."));
-    }
-    if (!text_hashes_ok()) {
-        error(XorStr("text section hash check failed."));
-    }
-    if (!text_page_protections_ok()) {
-        error(XorStr("text page protection check failed."));
-    }
-    if (!pe_header_ok()) {
-        error(XorStr("pe header check failed."));
-    }
-    if (detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) ||
-        detour_suspect(reinterpret_cast<const uint8_t*>(&checkInit)) ||
-        detour_suspect(reinterpret_cast<const uint8_t*>(&error))) {
-        error(XorStr("detour pattern detected."));
-    }
     const auto host = extract_host(url);
     if (hosts_override_present(host)) {
         error(XorStr("Hosts file override detected for API host."));
@@ -2865,6 +2825,9 @@ void checkInit() {
         if (timing_anomaly_detected()) {
             error(XorStr("timing anomaly detected, possible time tamper."));
         }
+        if (!LoggedIn.load()) {
+            goto periodic_done;
+        }
         if (!iat_virtualprotect_ok()) {
             error(XorStr("VirtualProtect IAT check failed."));
         }
@@ -2895,6 +2858,7 @@ void checkInit() {
             !func_region_ok(reinterpret_cast<const void*>(&check_section_integrity))) {
             error(XorStr("function region check failed, possible hook detected."));
         }
+periodic_done:
         if (check_section_integrity(XorStr(".text").c_str(), false)) {
             const int streak = integrity_fail_streak.fetch_add(1) + 1;
             if (streak >= 2) {
