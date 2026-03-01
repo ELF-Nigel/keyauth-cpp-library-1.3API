@@ -2418,9 +2418,8 @@ bool import_addresses_ok()
             !addr_in_module(reinterpret_cast<const void*>(&VirtualQuery), L"kernel32.dll"))
             return false;
     }
-    // curl functions can live in main module (static) or libcurl.dll (dynamic)
-    if (!addr_in_module(reinterpret_cast<const void*>(&curl_easy_perform), nullptr) &&
-        !addr_in_module(reinterpret_cast<const void*>(&curl_easy_perform), L"libcurl.dll"))
+    // curl functions must live in main module (static)
+    if (!addr_in_module(reinterpret_cast<const void*>(&curl_easy_perform), nullptr))
         return false;
     return true;
 }
