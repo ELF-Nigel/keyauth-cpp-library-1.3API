@@ -96,6 +96,7 @@ bool hypervisor_present();
 void snapshot_prologues();
 bool prologues_ok();
 bool func_region_ok(const void* addr);
+bool timing_anomaly_detected();
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
@@ -2053,6 +2054,23 @@ bool func_region_ok(const void* addr)
     return true;
 }
 
+bool timing_anomaly_detected()
+{
+    const auto wall_now = std::chrono::system_clock::now();
+    const auto steady_now = std::chrono::steady_clock::now();
+    static auto wall_last = wall_now;
+    static auto steady_last = steady_now;
+    const auto wall_delta = std::chrono::duration_cast<std::chrono::seconds>(wall_now - wall_last).count();
+    const auto steady_delta = std::chrono::duration_cast<std::chrono::seconds>(steady_now - steady_last).count();
+    wall_last = wall_now;
+    steady_last = steady_now;
+    if (wall_delta < -60 || wall_delta > 300)
+        return true;
+    if (std::llabs(wall_delta - steady_delta) > 120)
+        return true;
+    return false;
+}
+
 void KeyAuth::api::setDebug(bool value) {
     KeyAuth::api::debug = value;
 }
@@ -2446,6 +2464,9 @@ void checkInit() {
     const auto last_periodic = last_periodic_check.load();
     if (now - last_periodic > 30) {
         last_periodic_check.store(now);
+        if (timing_anomaly_detected()) {
+            error(XorStr("timing anomaly detected, possible time tamper."));
+        }
         if (!prologues_ok()) {
             error(XorStr("function prologue check failed, possible inline hook detected."));
         }
