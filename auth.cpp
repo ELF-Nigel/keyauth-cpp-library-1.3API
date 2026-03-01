@@ -2600,6 +2600,8 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
 
     std::string to_return;
     std::string headers;
+    struct curl_slist* req_headers = nullptr;
+    req_headers = curl_slist_append(req_headers, "Content-Type: application/x-www-form-urlencoded");
 
     PostData post{ data.c_str(), data.size(), 0 };
 
@@ -2618,11 +2620,13 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &to_return);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, &headers);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, req_headers);
 
     // Perform the request
     CURLcode code = curl_easy_perform(curl);
     if (code != CURLE_OK) {
         std::string errorMsg = "CURL Error: " + std::string(curl_easy_strerror(code));
+        if (req_headers) curl_slist_free_all(req_headers);
         curl_easy_cleanup(curl);  
         error(errorMsg);
     }
@@ -2630,6 +2634,7 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
     if (KeyAuth::api::debug) {
         debugInfo("n/a", "n/a", to_return, "n/a");
     }
+    if (req_headers) curl_slist_free_all(req_headers);
     curl_easy_cleanup(curl);
     secure_zero(data);
     return to_return;
