@@ -96,6 +96,7 @@ bool core_modules_signed();
 bool hypervisor_present();
 void snapshot_prologues();
 bool prologues_ok();
+bool func_region_ok(const void* addr);
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
@@ -2023,6 +2024,21 @@ bool prologues_ok()
         std::memcmp(pro_checkinit.data(), check_ptr, pro_checkinit.size()) == 0;
 }
 
+bool func_region_ok(const void* addr)
+{
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0)
+        return false;
+    if (mbi.Type != MEM_IMAGE)
+        return false;
+    const DWORD prot = mbi.Protect;
+    const bool exec = (prot & PAGE_EXECUTE) || (prot & PAGE_EXECUTE_READ) || (prot & PAGE_EXECUTE_READWRITE) || (prot & PAGE_EXECUTE_WRITECOPY);
+    const bool write = (prot & PAGE_READWRITE) || (prot & PAGE_EXECUTE_READWRITE) || (prot & PAGE_WRITECOPY) || (prot & PAGE_EXECUTE_WRITECOPY);
+    if (!exec || write)
+        return false;
+    return true;
+}
+
 void KeyAuth::api::setDebug(bool value) {
     KeyAuth::api::debug = value;
 }
@@ -2416,6 +2432,11 @@ void checkInit() {
     if (!prologues_ok()) {
         error(XorStr("function prologue check failed, possible inline hook detected."));
     }
+    if (!func_region_ok(reinterpret_cast<const void*>(&KeyAuth::api::req)) ||
+        !func_region_ok(reinterpret_cast<const void*>(&VerifyPayload)) ||
+        !func_region_ok(reinterpret_cast<const void*>(&checkInit))) {
+        error(XorStr("function region check failed, possible hook detected."));
+    }
     integrity_check();
 }
 
@@ -2450,6 +2471,11 @@ void integrity_watchdog() {
         }
         if (!prologues_ok()) {
             error(XorStr("function prologue check failed, possible inline hook detected."));
+        }
+        if (!func_region_ok(reinterpret_cast<const void*>(&KeyAuth::api::req)) ||
+            !func_region_ok(reinterpret_cast<const void*>(&VerifyPayload)) ||
+            !func_region_ok(reinterpret_cast<const void*>(&checkInit))) {
+            error(XorStr("function region check failed, possible hook detected."));
         }
         if (check_section_integrity(XorStr(".text").c_str(), false)) {
             const int streak = integrity_fail_streak.fetch_add(1) + 1;
