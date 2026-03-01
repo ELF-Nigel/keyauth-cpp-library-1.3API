@@ -2052,10 +2052,15 @@ static void secure_zero(std::string& value)
     value.shrink_to_fit();
 }
 
+static void securewipe(std::string& value)
+{
+    secure_zero(value);
+}
+
 struct ScopeWipe {
     std::string* value;
     explicit ScopeWipe(std::string& v) : value(&v) {}
-    ~ScopeWipe() { secure_zero(*value); }
+    ~ScopeWipe() { securewipe(*value); }
 };
 
 static std::wstring get_system_dir()
