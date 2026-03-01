@@ -138,6 +138,7 @@ std::atomic<bool> text_prot_ready{ false };
 std::vector<std::pair<std::uintptr_t, DWORD>> text_protections;
 std::atomic<bool> pe_header_ready{ false };
 uint32_t pe_header_hash = 0;
+std::atomic<int> heavy_fail_streak{ 0 };
 
 void KeyAuth::api::init()
 {
@@ -2825,38 +2826,29 @@ void checkInit() {
         if (timing_anomaly_detected()) {
             error(XorStr("timing anomaly detected, possible time tamper."));
         }
-        if (!LoggedIn.load()) {
-            goto periodic_done;
-        }
-        if (!iat_virtualprotect_ok()) {
-            error(XorStr("VirtualProtect IAT check failed."));
-        }
-        if (!text_hashes_ok()) {
-            error(XorStr("text section hash check failed."));
-        }
-        if (!text_page_protections_ok()) {
-            error(XorStr("text page protection check failed."));
-        }
-        if (!pe_header_ok()) {
-            error(XorStr("pe header check failed."));
-        }
-        if (!import_addresses_ok()) {
-            error(XorStr("import address check failed."));
-        }
-        if (detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) ||
-            detour_suspect(reinterpret_cast<const uint8_t*>(&checkInit)) ||
-            detour_suspect(reinterpret_cast<const uint8_t*>(&error))) {
-            error(XorStr("detour pattern detected."));
-        }
-        if (!prologues_ok()) {
-            error(XorStr("function prologue check failed, possible inline hook detected."));
-        }
-        if (!func_region_ok(reinterpret_cast<const void*>(&VerifyPayload)) ||
-            !func_region_ok(reinterpret_cast<const void*>(&checkInit)) ||
-            !func_region_ok(reinterpret_cast<const void*>(&error)) ||
-            !func_region_ok(reinterpret_cast<const void*>(&integrity_check)) ||
-            !func_region_ok(reinterpret_cast<const void*>(&check_section_integrity))) {
-            error(XorStr("function region check failed, possible hook detected."));
+        const bool heavy_ok =
+            iat_virtualprotect_ok() &&
+            text_hashes_ok() &&
+            text_page_protections_ok() &&
+            pe_header_ok() &&
+            import_addresses_ok() &&
+            !detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) &&
+            !detour_suspect(reinterpret_cast<const uint8_t*>(&checkInit)) &&
+            !detour_suspect(reinterpret_cast<const uint8_t*>(&error)) &&
+            prologues_ok() &&
+            func_region_ok(reinterpret_cast<const void*>(&VerifyPayload)) &&
+            func_region_ok(reinterpret_cast<const void*>(&checkInit)) &&
+            func_region_ok(reinterpret_cast<const void*>(&error)) &&
+            func_region_ok(reinterpret_cast<const void*>(&integrity_check)) &&
+            func_region_ok(reinterpret_cast<const void*>(&check_section_integrity));
+
+        if (!heavy_ok) {
+            const int streak = heavy_fail_streak.fetch_add(1) + 1;
+            if (streak >= 2) {
+                error(XorStr("security checks failed, possible tamper detected."));
+            }
+        } else {
+            heavy_fail_streak.store(0);
         }
 periodic_done:
         if (check_section_integrity(XorStr(".text").c_str(), false)) {
