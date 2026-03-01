@@ -97,6 +97,8 @@ void snapshot_prologues();
 bool prologues_ok();
 bool func_region_ok(const void* addr);
 bool timing_anomaly_detected();
+void start_heartbeat(KeyAuth::api* instance);
+void heartbeat_thread(KeyAuth::api* instance);
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
@@ -110,6 +112,7 @@ std::atomic<int> integrity_fail_streak{ 0 };
 std::atomic<long long> last_module_check{ 0 };
 std::atomic<long long> last_periodic_check{ 0 };
 std::atomic<bool> prologues_ready{ false };
+std::atomic<bool> heartbeat_started{ false };
 std::array<uint8_t, 16> pro_req{};
 std::array<uint8_t, 16> pro_verify{};
 std::array<uint8_t, 16> pro_checkinit{};
@@ -350,6 +353,9 @@ void KeyAuth::api::login(std::string username, std::string password, std::string
 
                 LI_FN(GlobalAddAtomA)(ownerid.c_str());
 		LoggedIn.store(true);
+		start_heartbeat(this);
+		start_heartbeat(this);
+		start_heartbeat(this);
             }
             else {
                 LI_FN(exit)(12);
@@ -798,6 +804,7 @@ void KeyAuth::api::web_login()
 
                     LI_FN(GlobalAddAtomA)(ownerid.c_str());
 		    LoggedIn.store(true);
+		    start_heartbeat(this);
                 }
                 else {
                     LI_FN(exit)(12);
@@ -2065,6 +2072,29 @@ bool timing_anomaly_detected()
     if (std::llabs(wall_delta - steady_delta) > 120)
         return true;
     return false;
+}
+
+void heartbeat_thread(KeyAuth::api* instance)
+{
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> sleep_seconds(45, 90);
+    while (true) {
+        Sleep(static_cast<DWORD>(sleep_seconds(gen) * 1000));
+        if (!LoggedIn.load())
+            continue;
+        instance->check(false);
+        if (!instance->response.success) {
+            error(XorStr("session check failed."));
+        }
+    }
+}
+
+void start_heartbeat(KeyAuth::api* instance)
+{
+    if (heartbeat_started.exchange(true))
+        return;
+    std::thread(heartbeat_thread, instance).detach();
 }
 
 void KeyAuth::api::setDebug(bool value) {
