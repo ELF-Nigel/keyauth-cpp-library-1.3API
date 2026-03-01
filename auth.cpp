@@ -94,6 +94,8 @@ bool user_writable_module_present();
 bool module_has_rwx_section(HMODULE mod);
 bool core_modules_signed();
 bool hypervisor_present();
+static std::wstring get_system_dir();
+static std::wstring get_syswow_dir();
 void snapshot_prologues();
 bool prologues_ok();
 bool func_region_ok(const void* addr);
@@ -124,7 +126,6 @@ std::atomic<long long> last_module_check{ 0 };
 std::atomic<long long> last_periodic_check{ 0 };
 std::atomic<bool> prologues_ready{ false };
 std::atomic<bool> heartbeat_started{ false };
-std::array<uint8_t, 16> pro_req{};
 std::array<uint8_t, 16> pro_verify{};
 std::array<uint8_t, 16> pro_checkinit{};
 std::array<uint8_t, 16> pro_error{};
@@ -1680,8 +1681,7 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     if (!pe_header_ok()) {
         error(XorStr("pe header check failed."));
     }
-    if (detour_suspect(reinterpret_cast<const uint8_t*>(&KeyAuth::api::req)) ||
-        detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) ||
+    if (detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) ||
         detour_suspect(reinterpret_cast<const uint8_t*>(&checkInit)) ||
         detour_suspect(reinterpret_cast<const uint8_t*>(&error))) {
         error(XorStr("detour pattern detected."));
@@ -2070,13 +2070,11 @@ void snapshot_prologues()
 {
     if (prologues_ready.load())
         return;
-    const auto req_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&KeyAuth::api::req));
     const auto verify_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&VerifyPayload));
     const auto check_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&checkInit));
     const auto error_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&error));
     const auto integ_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&integrity_check));
     const auto section_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&check_section_integrity));
-    std::memcpy(pro_req.data(), req_ptr, pro_req.size());
     std::memcpy(pro_verify.data(), verify_ptr, pro_verify.size());
     std::memcpy(pro_checkinit.data(), check_ptr, pro_checkinit.size());
     std::memcpy(pro_error.data(), error_ptr, pro_error.size());
@@ -2092,14 +2090,12 @@ bool prologues_ok()
 {
     if (!prologues_ready.load())
         return true;
-    const auto req_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&KeyAuth::api::req));
     const auto verify_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&VerifyPayload));
     const auto check_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&checkInit));
     const auto error_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&error));
     const auto integ_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&integrity_check));
     const auto section_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&check_section_integrity));
-    return std::memcmp(pro_req.data(), req_ptr, pro_req.size()) == 0 &&
-        std::memcmp(pro_verify.data(), verify_ptr, pro_verify.size()) == 0 &&
+    return std::memcmp(pro_verify.data(), verify_ptr, pro_verify.size()) == 0 &&
         std::memcmp(pro_checkinit.data(), check_ptr, pro_checkinit.size()) == 0 &&
         std::memcmp(pro_error.data(), error_ptr, pro_error.size()) == 0 &&
         std::memcmp(pro_integrity.data(), integ_ptr, pro_integrity.size()) == 0 &&
@@ -2441,8 +2437,7 @@ std::string KeyAuth::api::req(const std::string& data, const std::string& url) {
     if (!prologues_ok()) {
         error(XorStr("function prologue check failed, possible inline hook detected."));
     }
-    if (!func_region_ok(reinterpret_cast<const void*>(&KeyAuth::api::req)) ||
-        !func_region_ok(reinterpret_cast<const void*>(&VerifyPayload)) ||
+    if (!func_region_ok(reinterpret_cast<const void*>(&VerifyPayload)) ||
         !func_region_ok(reinterpret_cast<const void*>(&checkInit)) ||
         !func_region_ok(reinterpret_cast<const void*>(&error)) ||
         !func_region_ok(reinterpret_cast<const void*>(&integrity_check)) ||
@@ -2464,8 +2459,7 @@ std::string KeyAuth::api::req(const std::string& data, const std::string& url) {
     if (!pe_header_ok()) {
         error(XorStr("pe header check failed."));
     }
-    if (detour_suspect(reinterpret_cast<const uint8_t*>(&KeyAuth::api::req)) ||
-        detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) ||
+    if (detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) ||
         detour_suspect(reinterpret_cast<const uint8_t*>(&checkInit)) ||
         detour_suspect(reinterpret_cast<const uint8_t*>(&error))) {
         error(XorStr("detour pattern detected."));
@@ -2873,8 +2867,7 @@ void checkInit() {
         if (!import_addresses_ok()) {
             error(XorStr("import address check failed."));
         }
-        if (detour_suspect(reinterpret_cast<const uint8_t*>(&KeyAuth::api::req)) ||
-            detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) ||
+        if (detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) ||
             detour_suspect(reinterpret_cast<const uint8_t*>(&checkInit)) ||
             detour_suspect(reinterpret_cast<const uint8_t*>(&error))) {
             error(XorStr("detour pattern detected."));
@@ -2882,8 +2875,7 @@ void checkInit() {
         if (!prologues_ok()) {
             error(XorStr("function prologue check failed, possible inline hook detected."));
         }
-        if (!func_region_ok(reinterpret_cast<const void*>(&KeyAuth::api::req)) ||
-            !func_region_ok(reinterpret_cast<const void*>(&VerifyPayload)) ||
+        if (!func_region_ok(reinterpret_cast<const void*>(&VerifyPayload)) ||
             !func_region_ok(reinterpret_cast<const void*>(&checkInit)) ||
             !func_region_ok(reinterpret_cast<const void*>(&error)) ||
             !func_region_ok(reinterpret_cast<const void*>(&integrity_check)) ||
@@ -2902,8 +2894,7 @@ void checkInit() {
     if (!prologues_ok()) {
         error(XorStr("function prologue check failed, possible inline hook detected."));
     }
-    if (!func_region_ok(reinterpret_cast<const void*>(&KeyAuth::api::req)) ||
-        !func_region_ok(reinterpret_cast<const void*>(&VerifyPayload)) ||
+    if (!func_region_ok(reinterpret_cast<const void*>(&VerifyPayload)) ||
         !func_region_ok(reinterpret_cast<const void*>(&checkInit)) ||
         !func_region_ok(reinterpret_cast<const void*>(&error)) ||
         !func_region_ok(reinterpret_cast<const void*>(&integrity_check)) ||
