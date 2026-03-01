@@ -46,6 +46,8 @@
 #include <softpub.h>
 #include <cwctype>
 #include <intrin.h>
+#include <array>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <array>
@@ -92,6 +94,8 @@ bool user_writable_module_present();
 bool module_has_rwx_section(HMODULE mod);
 bool core_modules_signed();
 bool hypervisor_present();
+void snapshot_prologues();
+bool prologues_ok();
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
@@ -103,11 +107,16 @@ std::atomic<bool> LoggedIn(false);
 std::atomic<long long> last_integrity_check{ 0 };
 std::atomic<int> integrity_fail_streak{ 0 };
 std::atomic<long long> last_module_check{ 0 };
+std::atomic<bool> prologues_ready{ false };
+std::array<uint8_t, 16> pro_req{};
+std::array<uint8_t, 16> pro_verify{};
+std::array<uint8_t, 16> pro_checkinit{};
 
 void KeyAuth::api::init()
 {
     std::thread(runChecks).detach();
     std::thread(integrity_watchdog).detach();
+    snapshot_prologues();
     seed = generate_random_number();
     std::atexit([]() { cleanUpSeedData(seed); });
     CreateThread(0, 0, (LPTHREAD_START_ROUTINE)modify, 0, 0, 0);
@@ -1989,6 +1998,31 @@ bool hypervisor_present()
     return false;
 }
 
+void snapshot_prologues()
+{
+    if (prologues_ready.load())
+        return;
+    const auto req_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&KeyAuth::api::req));
+    const auto verify_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&VerifyPayload));
+    const auto check_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&checkInit));
+    std::memcpy(pro_req.data(), req_ptr, pro_req.size());
+    std::memcpy(pro_verify.data(), verify_ptr, pro_verify.size());
+    std::memcpy(pro_checkinit.data(), check_ptr, pro_checkinit.size());
+    prologues_ready.store(true);
+}
+
+bool prologues_ok()
+{
+    if (!prologues_ready.load())
+        return true;
+    const auto req_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&KeyAuth::api::req));
+    const auto verify_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&VerifyPayload));
+    const auto check_ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&checkInit));
+    return std::memcmp(pro_req.data(), req_ptr, pro_req.size()) == 0 &&
+        std::memcmp(pro_verify.data(), verify_ptr, pro_verify.size()) == 0 &&
+        std::memcmp(pro_checkinit.data(), check_ptr, pro_checkinit.size()) == 0;
+}
+
 void KeyAuth::api::setDebug(bool value) {
     KeyAuth::api::debug = value;
 }
@@ -2379,6 +2413,9 @@ void checkInit() {
             error(XorStr("module path check failed, possible side-load detected."));
         }
     }
+    if (!prologues_ok()) {
+        error(XorStr("function prologue check failed, possible inline hook detected."));
+    }
     integrity_check();
 }
 
@@ -2410,6 +2447,9 @@ void integrity_watchdog() {
             if (!module_paths_ok() || duplicate_system_modules_present() || user_writable_module_present() || !core_modules_signed() || hypervisor_present()) {
                 error(XorStr("module path check failed, possible side-load detected."));
             }
+        }
+        if (!prologues_ok()) {
+            error(XorStr("function prologue check failed, possible inline hook detected."));
         }
         if (check_section_integrity(XorStr(".text").c_str(), false)) {
             const int streak = integrity_fail_streak.fetch_add(1) + 1;
