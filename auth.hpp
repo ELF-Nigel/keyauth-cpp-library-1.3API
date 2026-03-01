@@ -150,7 +150,7 @@ namespace KeyAuth {
 		}
 
 		void load_channel_data(nlohmann::json data) {
-			api::response.success = data["success"]; // intentional. Possibly trick a reverse engineer into thinking this string is for login function
+			api::response.success = data[XorStr("success")]; // intentional. Possibly trick a reverse engineer into thinking this string is for login function
 			api::response.message = data["message"];
 			api::response.channeldata.clear(); //If you do not delete the data before pushing it, the data will be repeated. github.com/TTakaTit
 			if (!data.contains("messages") || !data["messages"].is_array()) {

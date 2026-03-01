@@ -419,7 +419,7 @@ bool KeyAuth::api::chatsend(std::string message, std::string channel)
     auto response = req(data, url);
     auto json = response_decoder.parse(response);
     load_response_data(json);
-    return json[("success")];
+    return json[XorStr("success")];
 }
 
 void KeyAuth::api::changeUsername(std::string newusername)
@@ -481,7 +481,7 @@ KeyAuth::api::Tfa& KeyAuth::api::enable2fa(std::string code)
 
     if (json.contains("2fa")) {
 
-        api::response.success = json["success"];
+        api::response.success = json[XorStr("success")];
         api::tfa.secret = json["2fa"]["secret_code"];
         api::tfa.link = json["2fa"]["QRCode"];
     }
@@ -1333,7 +1333,7 @@ bool KeyAuth::api::checkblack() {
         size_t resultCode = hasher(json[(XorStr("code"))]);
 
         if (!json[(XorStr("success"))] || (json[(XorStr("success"))] && (resultCode == expectedHash))) {
-            return json[("success")];
+            return json[XorStr("success")];
         }
         LI_FN(exit)(9);
     }
