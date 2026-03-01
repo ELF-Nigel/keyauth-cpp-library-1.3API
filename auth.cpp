@@ -49,6 +49,7 @@
 #include <array>
 #include <cstring>
 #include <vector>
+#include <utility>
 #include <stdexcept>
 #include <string>
 #include <array>
@@ -112,6 +113,7 @@ void snapshot_pe_header();
 bool pe_header_ok();
 bool iat_virtualprotect_ok();
 bool module_allowlist_ok();
+static void secure_zero(std::string& value);
 std::string seed;
 void cleanUpSeedData(const std::string& seed);
 std::string signature;
@@ -1995,6 +1997,15 @@ static bool file_exists(const std::wstring& path)
     return (attr != INVALID_FILE_ATTRIBUTES) && !(attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+static void secure_zero(std::string& value)
+{
+    if (value.empty())
+        return;
+    SecureZeroMemory(value.data(), value.size());
+    value.clear();
+    value.shrink_to_fit();
+}
+
 static std::wstring get_system_dir()
 {
     wchar_t buf[MAX_PATH] = {};
@@ -2424,7 +2435,7 @@ void KeyAuth::api::setDebug(bool value) {
     KeyAuth::api::debug = value;
 }
 
-std::string KeyAuth::api::req(const std::string& data, const std::string& url) {
+std::string KeyAuth::api::req(std::string data, const std::string& url) {
     signature.clear();
     signatureTimestamp.clear();
     integrity_check();
@@ -2472,7 +2483,8 @@ std::string KeyAuth::api::req(const std::string& data, const std::string& url) {
     }
 
     debugInfo(data, url, to_return, "Sig: " + signature + "\nTimestamp:" + signatureTimestamp);
-    curl_easy_cleanup(curl); 
+    curl_easy_cleanup(curl);
+    secure_zero(data);
     return to_return;
 }
 

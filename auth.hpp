@@ -107,7 +107,7 @@ namespace KeyAuth {
 	private:
 
 		std::string sessionid, enckey;
-		static std::string req(const std::string& data, const std::string& url);
+		static std::string req(std::string data, const std::string& url);
 		static void debugInfo(std::string data, std::string url, std::string response, std::string headers);
 		static void setDebug(bool value);
 		
