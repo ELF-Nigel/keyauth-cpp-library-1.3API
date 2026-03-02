@@ -114,25 +114,33 @@ namespace KeyAuth {
 		
 
 		void load_user_data(nlohmann::json data) {
-			api::user_data.username = data.value(XorStr("username"), "");
-			api::user_data.ip = data.value(XorStr("ip"), "");
-			if (!data.contains(XorStr("hwid")) || data[XorStr("hwid")].is_null()) {
+			const std::string key_username = XorStr("username");
+			const std::string key_ip = XorStr("ip");
+			const std::string key_hwid = XorStr("hwid");
+			const std::string key_created = XorStr("createdate");
+			const std::string key_lastlogin = XorStr("lastlogin");
+			const std::string key_subs = XorStr("subscriptions");
+			const std::string key_sub_name = XorStr("subscription");
+			const std::string key_sub_expiry = XorStr("expiry");
+			api::user_data.username = data.value(key_username, "");
+			api::user_data.ip = data.value(key_ip, "");
+			if (!data.contains(key_hwid) || data[key_hwid].is_null()) {
 				api::user_data.hwid = XorStr("none");
 			}
 			else {
-				api::user_data.hwid = data[XorStr("hwid")];
+				api::user_data.hwid = data[key_hwid];
 			}
-			api::user_data.createdate = data.value(XorStr("createdate"), "");
-			api::user_data.lastlogin = data.value(XorStr("lastlogin"), "");
+			api::user_data.createdate = data.value(key_created, "");
+			api::user_data.lastlogin = data.value(key_lastlogin, "");
 
 			api::user_data.subscriptions.clear();
-			if (data.contains(XorStr("subscriptions")) && data[XorStr("subscriptions")].is_array()) {
-				for (const auto& sub : data[XorStr("subscriptions")]) {
+			if (data.contains(key_subs) && data[key_subs].is_array()) {
+				for (const auto& sub : data[key_subs]) {
 					subscriptions_class subscriptions;
-					if (sub.contains(XorStr("subscription")))
-						subscriptions.name = sub.value(XorStr("subscription"), "");
-					if (sub.contains(XorStr("expiry")))
-						subscriptions.expiry = sub.value(XorStr("expiry"), "");
+					if (sub.contains(key_sub_name))
+						subscriptions.name = sub.value(key_sub_name, "");
+					if (sub.contains(key_sub_expiry))
+						subscriptions.expiry = sub.value(key_sub_expiry, "");
 					api::user_data.subscriptions.emplace_back(subscriptions);
 				}
 			}
@@ -162,12 +170,14 @@ namespace KeyAuth {
 			if (!data.contains("messages") || !data["messages"].is_array()) {
 				return; // avoid invalid server payload crash. -nigel
 			}
+			const std::string key_author = XorStr("author");
+			const std::string key_timestamp = XorStr("timestamp");
 			for (const auto& sub : data["messages"]) {
 				if (!sub.is_object())
 					continue;
-				std::string authoroutput = sub.value(XorStr("author"), "");
+				std::string authoroutput = sub.value(key_author, "");
 				std::string messageoutput = sub.value("message", "");
-				const int timestamp = sub.value(XorStr("timestamp"), 0);
+				const int timestamp = sub.value(key_timestamp, 0);
 				std::string timestampoutput = std::to_string(timestamp);
 				authoroutput.erase(remove(authoroutput.begin(), authoroutput.end(), '"'), authoroutput.end());
 				messageoutput.erase(remove(messageoutput.begin(), messageoutput.end(), '"'), messageoutput.end());
