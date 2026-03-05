@@ -164,6 +164,9 @@ static std::atomic<uint32_t> text_crc_baseline{ 0 };
 static std::array<uint8_t, 16> checkinit_prologue{};
 static std::atomic<bool> checkinit_ready{ false };
 static std::atomic<bool> watchdog_started{ false };
+static std::atomic<uint32_t> curl_crc_baseline{ 0 };
+static std::atomic<uint32_t> sodium_crc_baseline{ 0 };
+
 
 static inline void secure_zero(std::string& value) noexcept
 {
@@ -2433,6 +2436,7 @@ static std::wstring get_syswow_dir()
     return std::wstring(buf);
 }
 
+static std::wstring normalize_path(std::string p)
 
 void snapshot_prologues()
 {
@@ -3762,6 +3766,34 @@ void checkInit() {
 
         if (!iat_integrity_ok()) {
             error(XorStr("iat integrity check failed."));
+        }
+
+        if (!critical_modules_safe()) {
+            error(XorStr("critical module path violation."));
+        }
+
+        HMODULE curl = GetModuleHandleW(L"libcurl.dll");
+        if (curl) {
+            std::wstring p;
+            if (get_module_path(curl, p)) {
+                uint32_t now_crc = file_crc32(p);
+                uint32_t base_crc = curl_crc_baseline.load();
+                if (base_crc != 0 && now_crc != base_crc) {
+                    error(XorStr("libcurl checksum mismatch."));
+                }
+            }
+        }
+
+        HMODULE sodium = GetModuleHandleW(L"libsodium.dll");
+        if (sodium) {
+            std::wstring p;
+            if (get_module_path(sodium, p)) {
+                uint32_t now_crc = file_crc32(p);
+                uint32_t base_crc = sodium_crc_baseline.load();
+                if (base_crc != 0 && now_crc != base_crc) {
+                    error(XorStr("libsodium checksum mismatch."));
+                }
+            }
         }
 
 periodic_done:
