@@ -137,7 +137,22 @@ void cleanUpSeedData(const std::string& seed);
 std::string signature;
 std::string signatureTimestamp;
 bool initialized;
-std::string API_PUBLIC_KEY = "5586b4bc69c7a4b487e4563a4cd96afd39140f919bd31cea7d1c6a1e8439422b";
+static constexpr uint8_t k_pubkey_xor1 = 0x5A;
+static constexpr uint8_t k_pubkey_xor2 = 0xA5;
+static constexpr uint64_t k_pubkey_fnv1a = 0x7553f24ca052d4b1ULL;
+static const uint8_t k_pubkey_obf1[64] = {
+    0x6f, 0x6f, 0x62, 0x6c, 0x38, 0x6e, 0x38, 0x39, 0x6c, 0x63, 0x39, 0x6d, 0x3b, 0x6e, 0x38, 0x6e,
+    0x62, 0x6d, 0x3f, 0x6e, 0x6f, 0x6c, 0x69, 0x3b, 0x6e, 0x39, 0x3e, 0x63, 0x6c, 0x3b, 0x3c, 0x3e,
+    0x69, 0x63, 0x6b, 0x6e, 0x6a, 0x3c, 0x63, 0x6b, 0x63, 0x38, 0x3e, 0x69, 0x6b, 0x39, 0x3f, 0x3b,
+    0x6d, 0x3e, 0x6b, 0x39, 0x6c, 0x3b, 0x6b, 0x3f, 0x62, 0x6e, 0x69, 0x63, 0x6e, 0x68, 0x68, 0x38
+};
+static const uint8_t k_pubkey_obf2[64] = {
+    0x90, 0x90, 0x9d, 0x93, 0xc7, 0x91, 0xc7, 0xc6, 0x93, 0x9c, 0xc6, 0x92, 0xc4, 0x91, 0xc7, 0x91,
+    0x9d, 0x92, 0xc0, 0x91, 0x90, 0x93, 0x96, 0xc4, 0x91, 0xc6, 0xc1, 0x9c, 0x93, 0xc4, 0xc3, 0xc1,
+    0x96, 0x9c, 0x94, 0x91, 0x95, 0xc3, 0x9c, 0x94, 0x9c, 0xc7, 0xc1, 0x96, 0x94, 0xc6, 0xc0, 0xc4,
+    0x92, 0xc1, 0x94, 0xc6, 0x93, 0xc4, 0x94, 0xc0, 0x9d, 0x91, 0x96, 0x9c, 0x91, 0x97, 0x97, 0xc7
+};
+static std::atomic<uint64_t> pubkey_hash_seen{ 0 };
 bool KeyAuth::api::debug = false;
 std::atomic<bool> LoggedIn(false);
 std::atomic<long long> last_integrity_check{ 0 };
@@ -188,6 +203,59 @@ static inline void securewipe(std::string& value) noexcept
     secure_zero(value);
 }
 
+static uint64_t fnv1a64_bytes(const uint8_t* data, size_t len)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < len; ++i) {
+        h ^= static_cast<uint64_t>(data[i]);
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static std::string decode_pubkey_hex(const uint8_t* obf, size_t len, uint8_t key)
+{
+    std::string out;
+    out.resize(len);
+    for (size_t i = 0; i < len; ++i) {
+        out[i] = static_cast<char>(obf[i] ^ key);
+    }
+    return out;
+}
+
+static bool pubkey_memory_protect_ok()
+{
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(k_pubkey_obf1, &mbi, sizeof(mbi)))
+        return false;
+    const DWORD p = mbi.Protect;
+    if (p & PAGE_GUARD)
+        return false;
+    if ((p & PAGE_READWRITE) || (p & PAGE_WRITECOPY) ||
+        (p & PAGE_EXECUTE_READWRITE) || (p & PAGE_EXECUTE_WRITECOPY)) {
+        return false;
+    }
+    return true;
+}
+
+static std::string get_public_key_hex()
+{
+    if (!pubkey_memory_protect_ok()) {
+        error(XorStr("public key memory protection tampered."));
+    }
+    std::string a = decode_pubkey_hex(k_pubkey_obf1, sizeof(k_pubkey_obf1), k_pubkey_xor1);
+    std::string b = decode_pubkey_hex(k_pubkey_obf2, sizeof(k_pubkey_obf2), k_pubkey_xor2);
+    if (a != b) {
+        error(XorStr("public key mismatch detected."));
+    }
+    const uint64_t h = fnv1a64_bytes(reinterpret_cast<const uint8_t*>(a.data()), a.size());
+    pubkey_hash_seen.store(h, std::memory_order_relaxed);
+    if (h != k_pubkey_fnv1a) {
+        error(XorStr("public key integrity failed."));
+    }
+    return a;
+}
+
 struct ScopeWipe final {
     std::string* value;
     explicit ScopeWipe(std::string& v) noexcept : value(&v) {}
@@ -215,6 +283,7 @@ void KeyAuth::api::init()
     std::thread(runChecks).detach();
     snapshot_prologues();
     snapshot_checkinit();
+    (void)get_public_key_hex();
     seed = generate_random_number();
     std::atexit([]() { cleanUpSeedData(seed); });
 
@@ -1965,7 +2034,8 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
         exit(5);
     }
 
-    if (sodium_hex2bin(pk, sizeof(pk), API_PUBLIC_KEY.c_str(), API_PUBLIC_KEY.length(), NULL, NULL, NULL) != 0) {
+    const std::string pubkey_hex = get_public_key_hex();
+    if (sodium_hex2bin(pk, sizeof(pk), pubkey_hex.c_str(), pubkey_hex.length(), NULL, NULL, NULL) != 0) {
         std::cerr << "[ERROR] Failed to parse public key hex.\n";
         MessageBoxA(0, "Signature verification failed (invalid public key)", "KeyAuth", MB_ICONERROR);
         exit(6);
@@ -1975,7 +2045,7 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     std::cout << "[DEBUG] Signature: " << signature << std::endl;
     std::cout << "[DEBUG] Body: " << body << std::endl;
     std::cout << "[DEBUG] Message (timestamp + body): " << message << std::endl;
-    std::cout << "[DEBUG] Public Key: " << API_PUBLIC_KEY << std::endl;*/
+    std::cout << "[DEBUG] Public Key: " << pubkey_hex << std::endl;*/
 
     if (crypto_sign_ed25519_verify_detached(sig,
         reinterpret_cast<const unsigned char*>(message.c_str()),
