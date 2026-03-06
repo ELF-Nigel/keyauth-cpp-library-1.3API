@@ -122,6 +122,8 @@ void heartbeat_thread(KeyAuth::api* instance);
 void snapshot_text_hashes();
 bool text_hashes_ok();
 bool detour_suspect(const uint8_t* p);
+static bool entry_is_jmp_or_call(const void* fn);
+static bool entry_is_reg_jump(const void* fn);
 bool import_addresses_ok();
 void snapshot_text_page_protections();
 bool text_page_protections_ok();
@@ -3106,6 +3108,26 @@ bool detour_suspect(const uint8_t* p)
     return false;
 }
 
+static bool entry_is_jmp_or_call(const void* fn)
+{
+    if (!fn) return false;
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
+    if (p[0] == 0xE9) return true; // jmp rel32
+    if (p[0] == 0xFF && p[1] == 0x25) return true; // jmp [rip+imm32]
+    if (p[0] == 0xE8) return true; // call rel32
+    if (p[0] == 0x68 && p[5] == 0xC3) return true; // push imm32; ret
+    return false;
+}
+
+static bool entry_is_reg_jump(const void* fn)
+{
+    if (!fn) return false;
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
+    if (p[0] == 0xFF && (p[1] & 0xF8) == 0xE0) return true; // jmp reg
+    if (p[0] == 0xFF && (p[1] & 0xF8) == 0xD0) return true; // call reg
+    return false;
+}
+
 static bool addr_in_module(const void* addr, const wchar_t* module_name)
 {
     HMODULE mod = module_name ? GetModuleHandleW(module_name) : GetModuleHandle(nullptr);
@@ -3380,6 +3402,16 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
         !func_region_ok(reinterpret_cast<const void*>(&integrity_check)) ||
         !func_region_ok(reinterpret_cast<const void*>(&check_section_integrity))) {
         error(XorStr("function region check failed, possible hook detected."));
+    }
+    if (entry_is_jmp_or_call(reinterpret_cast<const void*>(&VerifyPayload)) ||
+        entry_is_jmp_or_call(reinterpret_cast<const void*>(&checkInit)) ||
+        entry_is_jmp_or_call(reinterpret_cast<const void*>(&integrity_check)) ||
+        entry_is_jmp_or_call(reinterpret_cast<const void*>(&check_section_integrity)) ||
+        entry_is_reg_jump(reinterpret_cast<const void*>(&VerifyPayload)) ||
+        entry_is_reg_jump(reinterpret_cast<const void*>(&checkInit)) ||
+        entry_is_reg_jump(reinterpret_cast<const void*>(&integrity_check)) ||
+        entry_is_reg_jump(reinterpret_cast<const void*>(&check_section_integrity))) {
+        error(XorStr("entry-point hook detected (jmp/call stub)."));
     }
     if (suspicious_processes_present() || suspicious_modules_present() || suspicious_windows_present()) {
         error(XorStr("debugger/emulator/proxy detected."));
@@ -4010,6 +4042,16 @@ void checkInit() {
             !detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) &&
             !detour_suspect(reinterpret_cast<const uint8_t*>(&checkInit)) &&
             !detour_suspect(reinterpret_cast<const uint8_t*>(&error)) &&
+            !entry_is_jmp_or_call(reinterpret_cast<const void*>(&VerifyPayload)) &&
+            !entry_is_jmp_or_call(reinterpret_cast<const void*>(&checkInit)) &&
+            !entry_is_jmp_or_call(reinterpret_cast<const void*>(&error)) &&
+            !entry_is_jmp_or_call(reinterpret_cast<const void*>(&integrity_check)) &&
+            !entry_is_jmp_or_call(reinterpret_cast<const void*>(&check_section_integrity)) &&
+            !entry_is_reg_jump(reinterpret_cast<const void*>(&VerifyPayload)) &&
+            !entry_is_reg_jump(reinterpret_cast<const void*>(&checkInit)) &&
+            !entry_is_reg_jump(reinterpret_cast<const void*>(&error)) &&
+            !entry_is_reg_jump(reinterpret_cast<const void*>(&integrity_check)) &&
+            !entry_is_reg_jump(reinterpret_cast<const void*>(&check_section_integrity)) &&
             prologues_ok() &&
             func_region_ok(reinterpret_cast<const void*>(&VerifyPayload)) &&
             func_region_ok(reinterpret_cast<const void*>(&checkInit)) &&
