@@ -60,7 +60,6 @@
 #include <utility>
 #include <stdexcept>
 #include <ws2tcpip.h>
-#include <winhttp.h>
 #include <windns.h>
 #include <tlhelp32.h>
 #include <string>
@@ -250,7 +249,6 @@ std::vector<std::pair<std::uintptr_t, DWORD>> data_protections;
 std::atomic<int> heavy_fail_streak{ 0 };
 static const char* kCriticalImports[] = {
     "WinVerifyTrust",
-    "WinHttpGetDefaultProxyConfiguration",
     "WinHttpSendRequest",
     "WinHttpReceiveResponse",
     "CryptVerifyMessageSignature",
@@ -402,7 +400,6 @@ static bool list_contains_any(const std::string& hay, const std::vector<std::str
 static bool suspicious_processes_present()
 {
     const std::vector<std::string> bad = {
-        "fiddler", "mitmproxy", "charles", "httpdebugger", "proxifier",
         "burpsuite", "wireshark", "tshark", "x64dbg", "x32dbg",
         "ollydbg", "ida", "cheatengine", "processhacker"
     };
@@ -451,7 +448,6 @@ static bool suspicious_modules_present()
 static bool suspicious_windows_present()
 {
     const std::vector<std::string> bad = {
-        "fiddler", "mitmproxy", "charles", "burp", "http debugger",
         "x64dbg", "x32dbg", "ollydbg", "ida", "cheat engine",
         "process hacker"
     };
@@ -2594,37 +2590,6 @@ static bool is_https_url(const std::string& url)
     return true;
 }
 
-static bool winhttp_proxy_set()
-{
-    WINHTTP_PROXY_INFO info{};
-    if (!WinHttpGetDefaultProxyConfiguration(&info))
-        return false;
-    bool set = false;
-    if (info.lpszProxy && *info.lpszProxy)
-        set = true;
-    if (info.lpszProxyBypass && *info.lpszProxyBypass)
-        set = true;
-    if (info.lpszProxy) GlobalFree(info.lpszProxy);
-    if (info.lpszProxyBypass) GlobalFree(info.lpszProxyBypass);
-    return set;
-}
-
-static bool winhttp_proxy_auto_set()
-{
-    WINHTTP_CURRENT_USER_IE_PROXY_CONFIG cfg{};
-    if (!WinHttpGetIEProxyConfigForCurrentUser(&cfg))
-        return false;
-    bool set = false;
-    if (cfg.fAutoDetect)
-        set = true;
-    if (cfg.lpszAutoConfigUrl && *cfg.lpszAutoConfigUrl)
-        set = true;
-    if (cfg.lpszAutoConfigUrl) GlobalFree(cfg.lpszAutoConfigUrl);
-    if (cfg.lpszProxy) GlobalFree(cfg.lpszProxy);
-    if (cfg.lpszProxyBypass) GlobalFree(cfg.lpszProxyBypass);
-    return set;
-}
-
 static bool host_resolves_private_only(const std::string& host, bool& has_public)
 {
     has_public = false;
@@ -4404,13 +4369,11 @@ void checkInit() {
 
         if (export_mismatch("KERNEL32.dll", "LoadLibraryA") ||
             export_mismatch("KERNEL32.dll", "GetProcAddress") ||
-            export_mismatch("WINHTTP.dll", "WinHttpGetDefaultProxyConfiguration") ||
             export_mismatch("WINTRUST.dll", "WinVerifyTrust")) {
             error(XorStr("export mismatch detected."));
         }
 
-        if (hotpatch_prologue_present(&WinVerifyTrust) ||
-            hotpatch_prologue_present(&WinHttpGetDefaultProxyConfiguration)) {
+        if (hotpatch_prologue_present(&WinVerifyTrust)) {
             error(XorStr("hotpatch prologue detected."));
         }
 
@@ -4428,7 +4391,6 @@ void checkInit() {
 
         if (iat_hook_suspect("KERNEL32.dll", "LoadLibraryA") ||
             iat_hook_suspect("KERNEL32.dll", "GetProcAddress") ||
-            iat_hook_suspect("WINHTTP.dll", "WinHttpGetDefaultProxyConfiguration") ||
             iat_hook_suspect("WINTRUST.dll", "WinVerifyTrust")) {
             error(XorStr("iat hook detected."));
         }
