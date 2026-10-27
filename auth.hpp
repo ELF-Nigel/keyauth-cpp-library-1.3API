@@ -1,3 +1,4 @@
+#pragma once
 #include <includes.hpp>
 #include <xorstr.hpp>
 #include <random>
@@ -5,6 +6,9 @@
 #include <atomic>
 #include <thread>
 #include <functional>
+#include <stdexcept>
+#include <mutex>
+#include <condition_variable>
 
 #define CURL_STATICLIB 
 
@@ -16,6 +20,13 @@ struct channel_struct
 };
 
 namespace KeyAuth {
+    // Network/server/signature errors reject the operation and can be retried by
+    // the application after correcting the cause. Do not retry mutations blindly.
+    class request_error : public std::runtime_error {
+    public:
+        using std::runtime_error::runtime_error;
+    };
+
 	class api {
 	public:
 
@@ -28,6 +39,7 @@ namespace KeyAuth {
 		    setDebug(debugParameter);
 		}
 
+		~api();
 		void ban(std::string reason = "");
 		void init();
 		void check(bool check_paid = false);
@@ -146,6 +158,15 @@ namespace KeyAuth {
 		void enable_secure_strings(bool enable = true);
 	private:
 
+        void checkInit();
+        void start_heartbeat();
+        bool initialized = false;
+        std::atomic<bool> LoggedIn{false};
+        std::recursive_mutex api_mutex_;
+        std::mutex heartbeat_mutex_;
+        std::condition_variable heartbeat_cv_;
+        bool heartbeat_stop_ = false;
+        std::thread heartbeat_thread_;
 		std::string sessionid, enckey;
 		std::vector<std::string> allowed_hosts;
 		std::vector<std::string> pinned_public_keys;

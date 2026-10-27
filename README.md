@@ -62,80 +62,94 @@ Notes:
 2. Use the same `CURL_STATICLIB` define as shown above when statically linking.
 3. Rebuild the library after pulling updates to keep everything in sync.
 
-## **Security Features (Built-In)**
-The library ships with security checks enabled by default. You do not need to manually call anything beyond `init()` and a normal login/license call.
+## Security and API compatibility
 
-What runs automatically:
-1. **Integrity checks** (prologue snapshots, function region validation, `.text` hashing, page protections).
-2. **Module checks** (core module signature verification + RWX section detection).
-3. **Hosts-file checks** for API host tampering.
-4. **Timing anomaly checks** to detect time tamper.
-5. **Session heartbeat** after successful login/license/upgrade/web login.
+The SDK retains the API 1.3 endpoint, TLS hostname/certificate verification,
+Ed25519 response verification, a 120 second signed timestamp window, and server
+session/blacklist checks. It does not automatically replace signing keys or pins.
+Compare upstream changes before rebuilding and distributing a new library.
 
-## **Security Overview**
-This SDK includes lightweight, client-side defenses that raise the cost of common bypass techniques while keeping normal integrations simple.
+Removed runtime enforcement: raw disk-versus-loaded PE comparisons, instruction
+pattern scanning, process ACL changes, repeated exception handlers, file/registry/
+atom markers, module-signature heuristics, and wall-clock tamper timers. These
+can reject legitimate Windows relocation, instrumentation, restricted accounts,
+slow initialization, and sleep/resume. They are not reliable evidence that a user
+has bypassed authentication. Server authentication and signed responses remain
+mandatory for normal API operations. Client-side code can still be patched by a
+person controlling the device; sensitive authorization must be enforced server-side.
 
-What it protects against:
-1. **Inline patching/NOPs**: prologue snapshots and detour heuristics catch modified function entry points.
-2. **Code tamper**: `.text` hashing and page‑protection checks detect modified code pages.
-3. **API redirection**: hosts‑file checks flag local DNS overrides of the API host.
-4. **Time spoofing**: timing anomaly checks reduce abuse of expired keys by system clock changes.
-5. **Tampered system DLLs**: core module signature checks reject patched or unsigned system libraries.
+The SDK checks HTTP status before checking signature headers, never automatically
+replays state-changing requests, and allows normal CDN DNS rotation. It rejects
+missing/invalid authentication signatures, conflicting signature headers and
+expired signed responses. The file endpoint retains upstream compatibility:
+downloads with neither signature header rely on verified HTTPS; partial or invalid
+signatures are rejected. Validate publisher signatures or an independently trusted
+digest before executing downloaded content.
 
-Benefits:
-1. **Fail‑closed behavior**: when a check fails, requests are blocked before the API call.
-2. **Low integration cost**: no additional calls are required beyond `init()` and a normal login/license flow.
-3. **Reduced false positives**: checks are limited to core modules and conservative tamper signals.
+API fields are individually URL encoded. Executable/token checksums use Windows
+cryptography rather than command shells. MD5 is used only for the existing API
+checksum fields; it is not an authentication primitive. Debug logging omits bodies.
 
-Design notes:
-1. These are **client‑side** protections. They complement — not replace — server‑side session validation.
-2. If you modify or strip checks, you reduce protection. Keep the SDK updated to inherit fixes.
-3. Optional hardening ideas are listed below for advanced users who accept higher false‑positive risk.
+## Handling errors
 
-How to keep security enabled:
-1. Always call `KeyAuthApp.init()` once before any other API call.
-2. Do not remove the built-in checks or tamper with the library internals.
-3. Keep your application linked against the updated library after pulling changes.
+Network, HTTP and signature failures now throw `KeyAuth::request_error` rather
+than terminating the host process. Unexpected signed response schemas may throw
+JSON exceptions. Catch exceptions at your application's API boundary and keep
+protected features unavailable when the operation fails:
 
-How to verify it is running:
-1. Use the library normally — the checks are automatic.
-2. If a check fails, the library will fail closed with an error message.
+```cpp
+try {
+    KeyAuthApp.init();
+    if (!KeyAuthApp.response.success) return 1;
+    KeyAuthApp.license("your_license_key");
+    if (!KeyAuthApp.response.success) return 1;
+} catch (const std::exception& error) {
+    std::cerr << error.what() << '\n';
+    return 1;
+}
+```
 
-## **Optional Hardening Ideas (Not Enabled)**
-These are intentionally **not** enabled in the library to avoid false positives, but you can add them if your app needs them.
+An HTTP 429/5xx, gateway/proxy page, or unsigned HTTP success is a failed request,
+not proof of user tampering. Do not remove signature validation to work around it.
+For timestamp failures, synchronize Windows time. A missing header cannot be
+reconstructed by the client; investigate the API/intermediary and sanitized logs.
 
-1. **PE header erase**: wipe PE header pages after load to make casual dumping harder. This is not a check; it simply reduces dump quality.
-2. **Module allowlists**: require a strict set of loaded modules; this breaks overlays and many legitimate plugins.
-3. **System module path checks**: enforce System32/SysWOW64-only paths; can fail on custom Windows installs.
-4. **Hypervisor detection**: block VMs; useful for niche threat models but unfriendly to legit users.
-5. **IAT validation**: detect import-table hooks for any imported API; can false-positive in some environments.
+## Threads and lifetime
 
-## **Security Troubleshooting**
-If you see security failures, common causes include:
-1. **Modified system DLLs**: non‑Microsoft versions or patched DLLs will be rejected.
-2. **Time tampering**: manual clock changes or large time skew can trigger timing checks.
-3. **Patched binaries**: inline hooks/NOP patches or modified `.text` will fail integrity checks.
+API operations are serialized per instance, including heartbeat calls. Initialization
+and login state belong to the instance. The owned heartbeat stops on destruction;
+network errors do not assert a ban. Stop the optional ban monitor before shutdown.
+Do not destroy an API instance from its monitor callback, concurrently destroy it
+while another thread calls it, or directly read/write public fields concurrently
+with background work. Configure hosts/pins before starting API activity.
 
-## **Changelog (Overhaul Summary)**
-This list summarizes all changes made in the overhaul:
-1. **Integrity checks**: prologue snapshots, function region validation, detour detection, `.text` slice hashing, page protections.
-2. **Module trust**: Microsoft signature verification for core DLLs, RWX section detection.
-3. **Timing checks**: timing anomaly detection to catch clock tamper.
-4. **Import checks**: import address validation.
-5. **Network hardening**: hosts‑file override detection for API host.
-6. **Session hardening**: session heartbeat after successful login/license/upgrade/web login.
-7. **DLL search order**: hardened DLL lookup and removed current‑dir hijacking.
-8. **String exposure**: request data zeroized after use; sensitive parameters wiped via `ScopeWipe`.
-9. **Debug logging**: minimized request/URL logging to reduce in‑memory exposure.
-10. **Parsing hardening**: safer JSON parsing and substring handling to avoid crashes.
-11. **Curl safety**: fixed cleanup issues; enforced static libcurl linkage.
-12. **Module path APIs**: removed hardcoded System32 paths (uses `GetSystemDirectoryW`).
-13. **Example/docs**: added usage section, security feature docs, and troubleshooting guidance.
+The `require_pinning` flag now requires a configured pin. Multiple `sha256//` pins
+can support an approved key rotation. TLS certificate/hostname verification stays
+enabled alongside pins. `block_private_dns` checks the connected private address;
+the legacy `block_custom_ca` field is not an implemented trust-store policy.
 
-Helpful references:
-- https://github.com/KeyAuth/KeyAuth-CPP-Example
-- https://keyauth.cc/app/
-- https://keyauth.cc/app/?page=forms
+## String visibility and version tags
+
+The hardcoded internal build tag has been removed. This does not prevent version
+fingerprinting or reverse engineering. `enable_secure_strings()` is optional XOR
+obfuscation of selected runtime configuration fields, not encryption or a place to
+store secrets. Windows imports such as `Sleep` and public API identifiers are not
+secrets. No import hiding, packer or anti-analysis mechanism is added by this patch.
+
+## Build and regression tests
+
+Rebuild applications against the updated headers and library together; the private
+instance layout changed. From a Visual Studio x64 developer prompt:
+
+```bat
+msbuild library.vcxproj /p:Configuration=Release /p:Platform=x64
+tests\run-tests.cmd
+```
+
+The tests cover HTTP header block isolation and duplicates, valid/tampered/expired
+Ed25519 messages, milliseconds timestamps, binary bodies, checksum vectors, malformed
+JSON handling and API object lifetime. They do not replace live application testing.
+
 
 ## **What is KeyAuth?**
 

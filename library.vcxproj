@@ -178,6 +178,9 @@
     <ClInclude Include="curl\options.h" />
     <ClInclude Include="curl\websockets.h" />
     <ClInclude Include="killEmulator.hpp" />
+    <ClInclude Include="response_headers.hpp" />
+    <ClInclude Include="payload_verifier.hpp" />
+    <ClInclude Include="file_digest.hpp" />
     <ClInclude Include="libsodium\include\sodium.h" />
     <ClInclude Include="libsodium\sodium.h" />
     <ClInclude Include="libsodium\sodium\core.h" />
