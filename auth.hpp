@@ -26,10 +26,31 @@
 #include <cctype>
 
 namespace keyauth_detail {
+inline std::wstring bounded_http_query(const wchar_t* query, size_t bytes,
+    const void* buffer, size_t buffer_size) {
+    if (!bytes) return {};
+    const auto start = reinterpret_cast<uintptr_t>(buffer);
+    const auto address = reinterpret_cast<uintptr_t>(query);
+    if (!buffer || !query || bytes % sizeof(wchar_t) || address % alignof(wchar_t) ||
+        address < start || address - start > buffer_size || bytes > buffer_size - (address - start))
+        throw std::invalid_argument("Invalid local HTTP query buffer.");
+    std::wstring value(query, bytes / sizeof(wchar_t));
+    if (value.find(L'\0') != std::wstring::npos)
+        throw std::invalid_argument("Invalid local HTTP query string.");
+    return value;
+}
+inline std::string http_reason(std::string value) {
+    if (value.size() > USHRT_MAX) value.resize(USHRT_MAX);
+    for (auto& c : value) if (static_cast<unsigned char>(c) < 32 || c == 127) c = ' ';
+    return value;
+}
 struct SignatureHeaders {
     std::string signature;
     std::string timestamp;
     bool conflicting = false;
+    bool signature_seen = false;
+    bool timestamp_seen = false;
+    long long timestamp_received_at = 0;
 };
 
 // libcurl may deliver CONNECT, informational, final and trailer header blocks.
@@ -48,11 +69,16 @@ inline bool consume_header(SignatureHeaders& out, std::string line) {
     if (key == "x-signature-ed25519") target = &out.signature;
     if (key == "x-signature-timestamp") target = &out.timestamp;
     if (!target) return true;
+    bool& seen = target == &out.signature ? out.signature_seen : out.timestamp_seen;
     std::string value = line.substr(colon + 1);
     const auto first = value.find_first_not_of(" \t\r\n");
     const auto last = value.find_last_not_of(" \t\r\n");
     value = first == std::string::npos ? "" : value.substr(first, last - first + 1);
-    if (!target->empty() && *target != value) out.conflicting = true;
+    if (!seen && target == &out.timestamp)
+        out.timestamp_received_at = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    if (seen && *target != value) out.conflicting = true;
+    seen = true;
     *target = value;
     return true;
 }
@@ -64,6 +90,13 @@ inline bool consume_header(SignatureHeaders& out, std::string line) {
 #include <cstdlib>
 
 namespace keyauth_detail {
+inline long long auth_window_for_seconds(long long seconds) {
+    return seconds < 0 ? 0 : seconds / 90 + 1;
+}
+inline long long auth_window_now() {
+    return auth_window_for_seconds(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 inline bool auth_window_fresh(long long sealed, long long current) {
     return sealed > 0 && current >= sealed && current - sealed <= 2;
 }
@@ -91,10 +124,12 @@ inline PayloadResult verify_payload(const std::string& signature,
         sodium_hex2bin(pk, sizeof(pk), public_key.data(), public_key.size(),
                        nullptr, &size, nullptr) != 0 || size != sizeof(pk))
         return PayloadResult::public_key_format;
-    const std::string message = timestamp + body;
-    return crypto_sign_verify_detached(sig,
+    std::string message = timestamp + body;
+    const auto result = crypto_sign_verify_detached(sig,
         reinterpret_cast<const unsigned char*>(message.data()), message.size(), pk) == 0
         ? PayloadResult::valid : PayloadResult::invalid_signature;
+    sodium_memzero(message.data(), message.size());
+    return result;
 }
 }
 
@@ -199,9 +234,32 @@ inline ApiEndpoint parse_api_endpoint(const std::string& input) {
         throw std::invalid_argument("API URL must use a DNS hostname.");
     if (curl_url_set(handle.get(), CURLUPART_HOST, endpoint.host.c_str(), 0) != CURLUE_OK)
         throw std::invalid_argument("Invalid API hostname.");
-    endpoint.url = part(CURLUPART_URL);
+    if (curl_url_set(handle.get(), CURLUPART_SCHEME, "https", 0) != CURLUE_OK)
+        throw std::invalid_argument("Invalid API scheme.");
+    endpoint.url = part(CURLUPART_URL, CURLU_NO_DEFAULT_PORT);
     if (endpoint.url.empty()) throw std::invalid_argument("Invalid API URL.");
     return endpoint;
+}
+
+inline std::string application_identity(const std::string& owner, const std::string& name,
+    const std::string& url) {
+    std::string identity;
+    const auto append = [&identity](const std::string& value) {
+        identity += std::to_string(value.size());
+        identity += ':';
+        identity += value;
+    };
+    append(owner);
+    append(name);
+    append(parse_api_endpoint(url).url);
+    return identity;
+}
+
+inline bool request_endpoint_matches(const std::string& base, const std::string& requested,
+    const std::string& operation) {
+    if (base == requested) return true;
+    return operation == "check" && requested == base +
+        (base.find('?') == std::string::npos ? "?" : "&") + "check_paid=1";
 }
 
 inline bool hosts_line_overrides(std::string line, const std::string& host) {
@@ -310,6 +368,29 @@ inline void validate_api_reply(const nlohmann::json& data, const std::string& ow
         throw std::invalid_argument("Invalid API success code.");
 }
 
+inline void validate_response_context(const nlohmann::json& data, const std::string& owner,
+    const std::string& name, const std::string& session, const std::string& operation) {
+    if (!data.is_object()) return;
+    const bool success = data.contains("success") && data["success"].is_boolean() && data["success"].get<bool>();
+    const auto match = [&](const char* field, const std::string& expected, bool allow_error_null) {
+        if (!data.contains(field)) return;
+        const auto& value = data[field];
+        if (!success && allow_error_null && value.is_null()) return;
+        if (!value.is_string() || value.get_ref<const std::string&>() != expected)
+            throw std::invalid_argument(std::string("API response context mismatch: ") + field);
+    };
+    match("ownerid", owner, false);
+    match("appname", name, true);
+    if (!data.contains("sessionid")) return;
+    const auto& value = data["sessionid"];
+    if (operation == "init") {
+        if (success && (!value.is_string() || value.get_ref<const std::string&>().empty()))
+            throw std::invalid_argument("Invalid initialization session identifier.");
+    } else if (!(operation == "logout" && success && value.is_string() && value.get_ref<const std::string&>().empty())) {
+        match("sessionid", session, true);
+    }
+}
+
 inline bool magic_link_approved(const nlohmann::json& data) {
     if (!data.is_object() || !data.contains("success") || !data["success"].is_boolean() ||
         !data["success"].get<bool>()) return false;
@@ -343,8 +424,14 @@ inline std::string email_request(const std::string& type, const std::string& ema
     auto encode = [](const std::string& value) {
         if (value.empty()) return std::string();
         if (value.size() > INT_MAX) throw std::invalid_argument("API input is too large.");
-        std::unique_ptr<char, decltype(&curl_free)> raw(
-            curl_easy_escape(nullptr, value.data(), static_cast<int>(value.size())), curl_free);
+        const auto release = [](char* value) noexcept {
+            if (value) {
+                sodium_memzero(value, std::strlen(value));
+                curl_free(value);
+            }
+        };
+        std::unique_ptr<char, decltype(release)> raw(
+            curl_easy_escape(nullptr, value.data(), static_cast<int>(value.size())), release);
         if (!raw) throw std::runtime_error("Could not encode API input.");
         return std::string(raw.get());
     };
@@ -356,6 +443,21 @@ inline std::string email_request(const std::string& type, const std::string& ema
     return request;
 }
 
+inline std::vector<unsigned char> decode_download(const std::string& encoded) {
+    auto nibble = [](unsigned char c) -> unsigned char {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        throw std::invalid_argument("Download contents are not valid hexadecimal data.");
+    };
+    if (encoded.size() % 2) throw std::invalid_argument("Download contents have an odd hexadecimal length.");
+    for (unsigned char c : encoded) (void)nibble(c);
+    std::vector<unsigned char> decoded(encoded.size() / 2);
+    for (size_t i = 0; i < decoded.size(); ++i)
+        decoded[i] = static_cast<unsigned char>((nibble(encoded[i * 2]) << 4) | nibble(encoded[i * 2 + 1]));
+    return decoded;
+}
+
 struct ResponseBuffer {
     std::string body;
     size_t limit;
@@ -363,7 +465,7 @@ struct ResponseBuffer {
 };
 
 inline bool append_response(ResponseBuffer& output, const char* bytes, size_t count) {
-    if (count > output.limit || output.body.size() > output.limit - count) {
+    if (output.limit && (count > output.limit || output.body.size() > output.limit - count)) {
         output.exceeded = true;
         return false;
     }
@@ -404,6 +506,8 @@ namespace KeyAuth {
 		void init();
 		void check(bool check_paid = false);
         bool authenticated(bool require_paid = false) const;
+        static std::string protect_data(const std::string& data);
+        static std::string unprotect_data(const std::string& data);
 		void log(std::string msg);
 		void license(std::string key, std::string code = "");
 		std::string var(std::string varid);
@@ -440,7 +544,7 @@ namespace KeyAuth {
         bool block_proxy = false;
         bool require_signed_downloads = true;
         size_t max_api_response_bytes = 8ULL * 1024 * 1024;
-        size_t max_download_response_bytes = 512ULL * 1024 * 1024;
+        size_t max_download_response_bytes = 0;
 		static std::string expiry_remaining(const std::string& expiry);
 		static constexpr const char* kSavePath = "test.json";
 		static constexpr int kInitFailSleepMs = 1500;
@@ -516,13 +620,13 @@ namespace KeyAuth {
 		Tfa tfa;
 
 		// Optional network hardening controls (do not require backend changes).
-		void set_allowed_hosts(const std::vector<std::string>& hosts) { allowed_hosts = hosts; }
-		void add_allowed_host(const std::string& host) { allowed_hosts.push_back(host); }
-		void clear_allowed_hosts() { allowed_hosts.clear(); }
+		void set_allowed_hosts(const std::vector<std::string>& hosts) { std::lock_guard<std::recursive_mutex> lock(api_mutex_); allowed_hosts = hosts; }
+		void add_allowed_host(const std::string& host) { std::lock_guard<std::recursive_mutex> lock(api_mutex_); allowed_hosts.push_back(host); }
+		void clear_allowed_hosts() { std::lock_guard<std::recursive_mutex> lock(api_mutex_); allowed_hosts.clear(); }
 
-		void set_pinned_public_keys(const std::vector<std::string>& pins) { pinned_public_keys = pins; }
-		void add_pinned_public_key(const std::string& pin) { pinned_public_keys.push_back(pin); }
-		void clear_pinned_public_keys() { pinned_public_keys.clear(); }
+		void set_pinned_public_keys(const std::vector<std::string>& pins) { std::lock_guard<std::recursive_mutex> lock(api_mutex_); pinned_public_keys = pins; }
+		void add_pinned_public_key(const std::string& pin) { std::lock_guard<std::recursive_mutex> lock(api_mutex_); pinned_public_keys.push_back(pin); }
+		void clear_pinned_public_keys() { std::lock_guard<std::recursive_mutex> lock(api_mutex_); pinned_public_keys.clear(); }
 
 		// Optional in-memory string protection. When enabled, public fields like
 		// name/ownerid/version/url/path are wiped and only decrypted on demand.
@@ -530,6 +634,9 @@ namespace KeyAuth {
 	private:
 
         void checkInit();
+        std::string initialization_context() const;
+        void bind_initialization_context();
+        bool initialization_context_valid() const;
         void start_heartbeat();
         bool initialized = false;
         std::atomic<bool> LoggedIn{false};
@@ -539,7 +646,7 @@ namespace KeyAuth {
         bool heartbeat_stop_ = false;
         std::thread heartbeat_thread_;
 		std::string sessionid, enckey;
-        std::string authenticated_host_;
+        std::string initialized_context_;
         std::string magic_link_email_;
         std::chrono::steady_clock::time_point magic_link_started_{};
         std::chrono::steady_clock::time_point magic_link_last_check_{};
@@ -565,6 +672,7 @@ namespace KeyAuth {
 		void refresh_auth_runtime();
 		bool local_auth_valid(bool require_paid = false, bool require_fresh = true) const;
 		bool has_active_subscription() const;
+        void store_auth_entitlements(bool reset_profile);
 		uint64_t compute_auth_seal(uint64_t nonce, long long window) const;
 
 		std::string req(std::string data, const std::string& url);
@@ -622,7 +730,10 @@ namespace KeyAuth {
 			api::response.message = data["message"];
 			api::response.isPaid = false;
 
-			if (data.contains(XorStr("role").c_str()) && data[XorStr("role")] != XorStr("tester").c_str() && data[XorStr("role")] != XorStr("not_checked").c_str()) {
+			if (api::response.success && data.contains(XorStr("role").c_str()) &&
+                data[XorStr("role")].is_string() &&
+                data[XorStr("role")].get_ref<const std::string&>().find_first_not_of(" \t\r\n") != std::string::npos &&
+                data[XorStr("role")] != XorStr("tester").c_str() && data[XorStr("role")] != XorStr("not_checked").c_str()) {
 				api::response.isPaid = true;
 			}
 		}

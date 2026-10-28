@@ -12,9 +12,25 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: setup msbuild
         uses: microsoft/setup-msbuild@v2
+
+      - name: Verify dependency inputs
+        shell: pwsh
+        run: |
+          $dependencies = @(
+            @('curl/libcurl.lib', 'ce95938a2ab28c117c060d0d230627e4394f2816e6bf0278582f4cc16f5252ff', 'https://curl.se/download/curl-8.23.0.zip', '85477fe11408471285f38a601e7c6f53470d13be9a5a316919b071ad02e68213'),
+            @('curl/zlib.lib', 'cb8f44532898db105798fcfa2e063ead4b4488ff9806782a8d3d0f410014e8c6', 'https://zlib.net/zlib132.zip', 'e8bf55f3017aa181690990cb58a994e77885da140609fc8f94abe9b65d2cae28'),
+            @('libsodium/libsodium.lib', '975fe3ea19d4c78ae8b3ac12fc9212063fea7edadbb6307f089f52febdafa371', 'https://download.libsodium.org/libsodium/releases/libsodium-1.0.20-stable-msvc.zip', 'ebaa204fdfcedc51dc1ee1bbd03c8d552a14b3372f87f94e44c71a8533f77df4')
+          )
+          foreach ($dependency in $dependencies) {
+            $actual = (Get-FileHash -LiteralPath $dependency[0] -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -cne $dependency[1]) { throw "Unexpected dependency binary: $($dependency[0])" }
+            Write-Output "Verified $($dependency[0]); upstream archive $($dependency[2]); source SHA256 $($dependency[3])"
+          }
 
       - name: build (release x64)
         shell: pwsh
@@ -34,13 +50,316 @@ jobs:
             }
           }
           $source = Join-Path $env:RUNNER_TEMP 'security-regression.cpp'
+          $testHeader = Join-Path $env:RUNNER_TEMP 'auth-test-access.hpp'
+          $headerText = [IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE 'auth.hpp'))
+          $headerText = $headerText.Replace("`tprivate:", "`tprivate:`n        friend struct keyauth_test_access;")
+          [IO.File]::WriteAllText($testHeader, $headerText)
           @'
           #define SODIUM_STATIC
-          #include "auth.hpp"
+          #include "auth-test-access.hpp"
+          #include <dpapi.h>
           #include <iostream>
+          #include <type_traits>
           #include <cstdlib>
           extern std::string curl_escape(CURL*, const std::string&);
           extern std::string get_str_between_two_str(const std::string&, const std::string&, const std::string&);
+          namespace KeyAuth {
+          struct keyauth_test_access {
+              static bool damaged_binding_rejected(api& app) {
+                  const auto saved = app.initialized_context_;
+                  app.initialized_context_.clear();
+                  bool rejected = !app.authenticated() && request_context_rejected(app, app.get_url());
+                  app.initialized_context_ = saved;
+                  app.initialized_context_[0] ^= 1;
+                  rejected = rejected && !app.authenticated() && request_context_rejected(app, app.get_url());
+                  app.initialized_context_ = saved;
+                  return rejected && app.authenticated();
+              }
+              static bool request_context_rejected(api& app, const std::string& url) {
+                  try { app.req("type=check", url); }
+                  catch (const request_error& error) {
+                      const std::string message = error.what();
+                      return message.find("Application configuration changed") == 0 ||
+                          message.find("Request endpoint does not match") == 0;
+                  }
+                  return false;
+              }
+              static bool response_paid(api& app, const nlohmann::json& data) {
+                  app.load_response_data(data);
+                  return app.response.isPaid;
+              }
+              static bool policy_snapshot_valid(api& app) {
+                  std::lock_guard<std::recursive_mutex> lock(app.api_mutex_);
+                  if (app.allowed_hosts.size() > 2 || app.pinned_public_keys.size() > 2) return false;
+                  for (const auto& host : app.allowed_hosts)
+                      if (host != "one.example" && host != "two.example") return false;
+                  for (const auto& pin : app.pinned_public_keys)
+                      if (pin != "sha256//one" && pin != "sha256//two") return false;
+                  return true;
+              }
+              static void establish(api& app, bool paid, const std::string& expiry) {
+                  app.initialized = true;
+                  app.bind_initialization_context();
+                  app.sessionid = "regression-session";
+                  app.user_data.username = "regression-user";
+                  app.user_data.subscriptions = {{"default", expiry}};
+                  app.response.success = true;
+                  app.response.isPaid = paid;
+                  app.mark_authenticated();
+              }
+              static void renew(api& app, bool paid) {
+                  app.response.isPaid = paid;
+                  app.refresh_auth_runtime();
+              }
+              static bool rejects_modified_state(api& app) {
+                  const auto saved = app.enckey;
+                  app.enckey[0] ^= 1;
+                  const bool rejected = !app.authenticated();
+                  app.enckey = saved;
+                  return rejected;
+              }
+              static bool rejects_modified_key(api& app) {
+                  const auto saved = app.auth_seal_key_;
+                  app.auth_seal_key_[0] ^= 1;
+                  const bool rejected = !app.authenticated();
+                  app.auth_seal_key_ = saved;
+                  return rejected;
+              }
+              static bool rejects_copied_state(api& from, api& to) {
+                  to.initialized = from.initialized;
+                  to.LoggedIn.store(true);
+                  to.sessionid = from.sessionid;
+                  to.initialized_context_ = from.initialized_context_;
+                  to.user_data = from.user_data;
+                  to.enckey = from.enckey;
+                  to.auth_seal_key_ = from.auth_seal_key_;
+                  to.auth_nonce_.store(from.auth_nonce_.load());
+                  to.auth_window_.store(from.auth_window_.load());
+                  to.auth_seal_.store(from.auth_seal_.load());
+                  return !to.authenticated();
+              }
+              static bool stale_state_can_renew(api& app) {
+                  const auto current = keyauth_detail::auth_window_now();
+                  const auto stale = current > 3 ? current - 3 : -1;
+                  app.auth_window_.store(stale);
+                  app.auth_seal_.store(app.compute_auth_seal(app.auth_nonce_.load(), stale));
+                  if (app.authenticated() || !app.local_auth_valid(false, false)) return false;
+                  renew(app, false);
+                  return app.authenticated();
+              }
+              static bool reset_wipes_state(api& app) {
+                  app.reset_auth_runtime();
+                  return !app.authenticated() && app.enckey.empty() &&
+                      std::all_of(app.auth_seal_key_.begin(), app.auth_seal_key_.end(),
+                          [](unsigned char value) { return value == 0; });
+              }
+          };
+          }
+          namespace authentication_state_test {
+          int run() {
+              const auto fail = [](int line) {
+                  std::cerr << "Authentication state regression failed at line " << line
+                      << "; current window " << keyauth_detail::auth_window_now() << "\n";
+                  return 1;
+              };
+              if (keyauth_detail::auth_window_for_seconds(0) != 1 ||
+                  keyauth_detail::auth_window_for_seconds(89) != 1 ||
+                  keyauth_detail::auth_window_for_seconds(90) != 2 ||
+                  keyauth_detail::auth_window_for_seconds(-1) != 0) return fail(__LINE__);
+              using access = KeyAuth::keyauth_test_access;
+              KeyAuth::api app("app", "1234567890", "1.0", "https://keyauth.win/api/1.3/", "");
+              KeyAuth::api other("app", "1234567890", "1.0", "https://keyauth.win/api/1.3/", "");
+              auto role_reply = nlohmann::json::parse(R"({"success":true,"message":"ok"})");
+              for (const auto& role : {nlohmann::json(nullptr), nlohmann::json(1), nlohmann::json(true),
+                  nlohmann::json::array(), nlohmann::json::object(), nlohmann::json(""),
+                  nlohmann::json(" "), nlohmann::json("tester"), nlohmann::json("not_checked")}) {
+                  role_reply["role"] = role;
+                  if (access::response_paid(app, role_reply)) return fail(__LINE__);
+              }
+              role_reply["role"] = "premium";
+              if (!access::response_paid(app, role_reply)) return fail(__LINE__);
+              role_reply["success"] = false;
+              if (access::response_paid(app, role_reply)) return fail(__LINE__);
+              const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                  std::chrono::system_clock::now().time_since_epoch()).count();
+              access::establish(app, false, "1");
+              if (!app.authenticated() || app.authenticated(true)) return fail(__LINE__);
+              app.response.isPaid = true;
+              app.user_data.subscriptions = {{"default", std::to_string(now + 3600)}};
+              if (app.authenticated(true)) return fail(__LINE__);
+              access::renew(app, false);
+              if (app.authenticated(true)) return fail(__LINE__);
+              access::renew(app, true);
+              if (!app.authenticated(true)) return fail(__LINE__);
+              app.response.isPaid = false;
+              if (!app.authenticated(true)) return fail(__LINE__);
+              if (!access::rejects_modified_state(app) || !access::rejects_modified_key(app)) return fail(__LINE__);
+              if (!access::rejects_copied_state(app, other)) return fail(__LINE__);
+              access::establish(app, false, std::to_string(now + 3600));
+              app.user_data.subscriptions.clear();
+              if (!app.authenticated(true)) return fail(__LINE__);
+              if (!access::stale_state_can_renew(app) || !app.authenticated(true)) return fail(__LINE__);
+              access::establish(app, false, std::to_string(now + 3600) + "invalid");
+              if (app.authenticated(true)) return fail(__LINE__);
+              app.name = "prefix|suffix";
+              access::establish(app, false, "1");
+              app.ownerid = "1234567890|prefix";
+              app.name = "suffix";
+              if (app.authenticated()) return fail(__LINE__);
+              app.ownerid = "1234567890";
+              app.name = "prefix|suffix";
+              if (!app.authenticated()) return fail(__LINE__);
+              if (!access::reset_wipes_state(app)) return fail(__LINE__);
+              std::thread hosts([&] {
+                  for (int i = 0; i < 250; ++i) {
+                      app.set_allowed_hosts({"one.example"});
+                      app.add_allowed_host("two.example");
+                      app.clear_allowed_hosts();
+                  }
+              });
+              std::thread pins([&] {
+                  for (int i = 0; i < 250; ++i) {
+                      app.set_pinned_public_keys({"sha256//one"});
+                      app.add_pinned_public_key("sha256//two");
+                      app.clear_pinned_public_keys();
+                  }
+              });
+              for (int i = 0; i < 250; ++i)
+                  if (!access::policy_snapshot_valid(app)) std::abort();
+              hosts.join();
+              pins.join();
+              if (!access::policy_snapshot_valid(app)) return fail(__LINE__);
+              std::cout << "Authentication state tampering and concurrent policy regression tests passed\n";
+              return 0;
+          }
+          }
+          namespace application_binding_test {
+          int run() {
+              using namespace keyauth_detail;
+              using access = KeyAuth::keyauth_test_access;
+              const auto fail = [](const char* message) { std::cerr << "Binding regression: " << message << "\n"; return 1; };
+              const std::string original = "https://auth.example.invalid/api/1.3/?channel=stable";
+              KeyAuth::api app("app", "1234567890", "1.0", original, "");
+              access::establish(app, false, "1");
+              if (!app.authenticated()) return fail("initial state");
+              if (!access::damaged_binding_rejected(app)) return fail("damaged binding");
+              app.name = "other";
+              if (app.authenticated() || !access::request_context_rejected(app, original)) return fail("app swap");
+              app.name = "app";
+              app.ownerid = "0987654321";
+              if (app.authenticated() || !access::request_context_rejected(app, original)) return fail("owner swap");
+              app.ownerid = "1234567890";
+              app.url = "https://auth.example.invalid/other/";
+              if (app.authenticated() || !access::request_context_rejected(app, app.url)) return fail("path swap");
+              app.url = original;
+              if (!access::request_context_rejected(app, "https://other.example.invalid/api/1.3/")) return fail("request redirect");
+              app.url = "HTTPS://AUTH.EXAMPLE.INVALID.:443/api/1.3/?channel=stable";
+              if (!app.authenticated()) return fail("equivalent URL");
+              app.enable_secure_strings();
+              if (!app.authenticated()) return fail("protected settings");
+              app.enable_secure_strings(false);
+              if (!app.authenticated()) return fail("restored settings");
+              const auto base = parse_api_endpoint(original).url;
+              if (!request_endpoint_matches(base, base, "login") ||
+                  !request_endpoint_matches(base, base + "&check_paid=1", "check") ||
+                  request_endpoint_matches(base, base + "&check_paid=1", "login") ||
+                  request_endpoint_matches(base, base + "&appname=other", "check")) return fail("query handling");
+              const auto plain = parse_api_endpoint("https://auth.example.invalid/api/1.3/").url;
+              if (!request_endpoint_matches(plain, plain + "?check_paid=1", "check")) return fail("plain paid query");
+              auto reply = nlohmann::json::parse(R"({"success":true,"ownerid":"owner","appname":"app","sessionid":"session"})");
+              validate_response_context(reply, "owner", "app", "session", "login");
+              validate_response_context(nlohmann::json::parse(R"({"success":true})"), "owner", "app", "session", "login");
+              for (const char* field : {"ownerid", "appname", "sessionid"}) {
+                  for (const auto& invalid : {nlohmann::json("other"), nlohmann::json(1), nlohmann::json(nullptr)}) {
+                      auto changed = reply;
+                      changed[field] = invalid;
+                      bool rejected = false;
+                      try { validate_response_context(changed, "owner", "app", "session", "login"); }
+                      catch (const std::invalid_argument&) { rejected = true; }
+                      if (!rejected) return fail("response swap or invalid identifier");
+                  }
+              }
+              reply["sessionid"] = "new-session";
+              validate_response_context(reply, "owner", "app", "", "init");
+              reply["sessionid"] = "";
+              validate_response_context(reply, "owner", "app", "session", "logout");
+              bool rejected = false;
+              try { validate_response_context(reply, "owner", "app", "", "init"); }
+              catch (const std::invalid_argument&) { rejected = true; }
+              if (!rejected) return fail("empty initialization session");
+              validate_response_context(nlohmann::json::parse(R"({"success":false,"sessionid":null,"appname":null})"),
+                  "owner", "app", "session", "check");
+              std::cout << "Application identity and signed response context regression tests passed\n";
+              return 0;
+          }
+          }
+          namespace string_lifetime_test {
+          int run() {
+              constexpr auto literal = XorStr("compile-time");
+              static_assert(sizeof(literal) > 0, "String wrapper must remain a literal type.");
+              const auto check = [](auto wrapped, const auto& expected) {
+                  using String = std::decay_t<decltype(expected)>;
+                  static_assert(std::is_standard_layout_v<decltype(wrapped)>);
+                  const size_t bytes = (expected.size() + 1) * sizeof(typename String::value_type);
+                  std::vector<unsigned char> before(bytes);
+                  std::memcpy(before.data(), &wrapped, bytes);
+                  if (wrapped.str() != expected || std::memcmp(before.data(), &wrapped, bytes) != 0) return false;
+                  const auto* view = wrapped.c_str();
+                  if (String(view) != expected || wrapped.str() != expected || String(view) != expected) return false;
+                  return true;
+              };
+              if (!check(XorStr("temporary-secret-marker"), std::string("temporary-secret-marker")) ||
+                  !check(XorStr(L"wide-marker"), std::wstring(L"wide-marker")) ||
+                  !check(XorStr(u"utf16-marker"), std::u16string(u"utf16-marker")) ||
+                  !check(XorStr(U"utf32-marker"), std::u32string(U"utf32-marker")) ||
+                  !check(XorStr(""), std::string())) return 1;
+              auto first = XorStr<sizeof("same"), 1>("same");
+              auto second = XorStr<sizeof("same"), 2>("same");
+              if (!(first == second) || !(std::string("same") == first) ||
+                  (first + second) != "samesame" || (std::string("x") + first) != "xsame") return 1;
+              std::ostringstream stream;
+              stream << first;
+              if (stream.str() != "same") return 1;
+              std::cout << "String conversion plaintext lifetime regression tests passed\n";
+              return 0;
+          }
+          }
+          namespace local_data_test {
+          int run() {
+              using KeyAuth::api;
+              std::string binary;
+              for (int i = 0; i < 256; ++i) binary.push_back(static_cast<char>(i));
+              for (const auto& plain : {std::string(), std::string("saved-passphrase"), binary}) {
+                  const auto protected_value = api::protect_data(plain);
+                  if (protected_value.rfind("keyauth:dpapi:v1:", 0) != 0 ||
+                      api::unprotect_data(protected_value) != plain) return 1;
+              }
+              const auto protected_value = api::protect_data("secret");
+              for (const auto& invalid : {std::string("plaintext"), std::string("keyauth:dpapi:v2:00"),
+                  protected_value + "z", protected_value.substr(0, protected_value.size() - 2)}) {
+                  bool rejected = false;
+                  try { api::unprotect_data(invalid); } catch (const KeyAuth::request_error&) { rejected = true; }
+                  if (!rejected) return 1;
+              }
+              std::string malformed = std::string("KA-DATA1payload") + std::string(crypto_generichash_BYTES, '\0');
+              DATA_BLOB input{static_cast<DWORD>(malformed.size()), reinterpret_cast<BYTE*>(malformed.data())};
+              DATA_BLOB output{};
+              if (!CryptProtectData(&input, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &output)) return 1;
+              std::string encoded("keyauth:dpapi:v1:");
+              const char hex[] = "0123456789abcdef";
+              for (DWORD i = 0; i < output.cbData; ++i) {
+                  encoded.push_back(hex[output.pbData[i] >> 4]);
+                  encoded.push_back(hex[output.pbData[i] & 15]);
+              }
+              SecureZeroMemory(output.pbData, output.cbData);
+              LocalFree(output.pbData);
+              bool rejected = false;
+              try { api::unprotect_data(encoded); } catch (const KeyAuth::request_error&) { rejected = true; }
+              if (!rejected) return 1;
+              std::cout << "Account-bound local data encryption regression tests passed\n";
+              return 0;
+          }
+          }
           namespace response_headers_test {
 
           static void require(bool condition) {
@@ -56,12 +375,33 @@ jobs:
               consume_header(h, "X-SIGNATURE-ED25519:\tvalid \t\r\n");
               consume_header(h, "x-signature-timestamp: 1770000000\r\n");
               require(h.signature == "valid" && h.timestamp == "1770000000");
+              require(h.timestamp_received_at > 0);
+              const auto observed_at = h.timestamp_received_at;
+              consume_header(h, "x-signature-timestamp: 1770000000\r\n");
+              require(h.timestamp_received_at == observed_at);
               consume_header(h, "x-signature-ed25519: valid\r\n");
               require(!h.conflicting);
               consume_header(h, "x-signature-ed25519: other\r\n");
               require(h.conflicting);
               consume_header(h, "HTTP/1.1 103 Early Hints\r\n");
               require(!h.conflicting && h.signature.empty());
+              consume_header(h, "x-signature-ed25519: \r\n");
+              consume_header(h, "x-signature-ed25519: interim\r\n");
+              require(h.conflicting);
+              consume_header(h, "HTTP/2 200\r\n");
+              require(!h.signature_seen && !h.timestamp_seen && !h.conflicting);
+              consume_header(h, "x-signature-timestamp: \r\n");
+              consume_header(h, "x-signature-timestamp: 1770000000\r\n");
+              require(h.conflicting);
+              consume_header(h, "HTTP/2 200\r\n");
+              consume_header(h, "x-signature-ed25519: same\r\n");
+              consume_header(h, "x-signature-ed25519: \r\n");
+              require(h.conflicting);
+              consume_header(h, "HTTP/2 200\r\n");
+              consume_header(h, "x-signature-timestamp: 1770000000\r\n");
+              consume_header(h, "x-signature-timestamp: 1770000000\r\n");
+              require(!h.conflicting);
+              consume_header(h, "HTTP/2 200\r\n");
               consume_header(h, "x-signature-ed25519: interim\r\n");
               consume_header(h, "HTTP/1.1 503 Service Unavailable\r\n");
               require(h.signature.empty());
@@ -150,15 +490,48 @@ jobs:
 
           namespace api_lifecycle_test {
           int run() {
+              const wchar_t query[] = {L'?', L'u', L'=', L'x'};
+              if (keyauth_detail::bounded_http_query(query, sizeof(query), query, sizeof(query)) != L"?u=x") return 1;
+              if (keyauth_detail::bounded_http_query(query + 1, 2 * sizeof(wchar_t), query, sizeof(query)) != L"u=") return 1;
+              if (!keyauth_detail::bounded_http_query(nullptr, 0, query, sizeof(query)).empty()) return 1;
+              auto rejects = [&](const wchar_t* value, size_t bytes) {
+                  try { keyauth_detail::bounded_http_query(value, bytes, query, sizeof(query)); }
+                  catch (const std::invalid_argument&) { return true; }
+                  return false;
+              };
+              if (!rejects(nullptr, 2) || !rejects(query, 1) || !rejects(query, sizeof(query) + 2) ||
+                  !rejects(query + 4, 2) || !rejects(reinterpret_cast<const wchar_t*>(reinterpret_cast<const char*>(query) + 1), 2)) return 1;
+              const wchar_t embedded[] = {L'?', L'\0', L'x'};
+              bool rejected = false;
+              try { keyauth_detail::bounded_http_query(embedded, sizeof(embedded), embedded, sizeof(embedded)); }
+              catch (const std::invalid_argument&) { rejected = true; }
+              if (!rejected) return 1;
+              if (keyauth_detail::http_reason("login denied") != "login denied" ||
+                  keyauth_detail::http_reason(std::string("a\r\n\0b", 5)) != "a   b" ||
+                  keyauth_detail::http_reason(std::string(70000, 'x')).size() != USHRT_MAX) return 1;
+              std::cout << "Local HTTP query and reason bounds regression tests passed\n";
               if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return 1;
+              const auto transport = curl_version_info(CURLVERSION_NOW);
+              if (!transport || transport->version_num < 0x081700 || !transport->libz_version ||
+                  std::string(transport->libz_version) != "1.3.2") return 1;
+              std::cout << "Linked transport: " << curl_version() << "; sodium: " << sodium_version_string() << "\n";
+              KeyAuth::api skipped("skipped", "1234567890", "1.0", "https://keyauth.win/api/1.3/", "");
+              skipped.response.success = true;
+              skipped.user_data.username = "forged";
+              skipped.response.isPaid = true;
+              if (skipped.authenticated() || skipped.authenticated(true)) return 1;
               const auto hwid = utils::get_hwid();
               if (hwid.rfind("S-1-", 0) != 0 || utils::get_hwid() != hwid) return 1;
               if (curl_escape(nullptr, "a&+= %") != "a%26%2B%3D%20%25") return 1;
+              const std::string binary("a\0b", 3);
+              if (curl_escape(nullptr, binary) != "a%00b" || binary != std::string("a\0b", 3)) return 1;
+              if (!curl_escape(nullptr, "").empty()) return 1;
               if (get_str_between_two_str("?user=test&token=abc", "&token=", "") != "abc") return 1;
               for (int i = 0; i < 10; ++i) {
                   KeyAuth::api first("first", "1234567890", "1.0", "https://keyauth.win/api/1.3/", "");
                   KeyAuth::api second("second", "0987654321", "1.0", "https://keyauth.win/api/1.3/", "");
                   if (!first.require_signed_downloads) return 1;
+                  if (first.max_download_response_bytes != 0) return 1;
                   first.response.success = true;
                   if (first.authenticated() || first.authenticated(true)) return 1;
                   if (!keyauth_detail::auth_window_fresh(10, 10) ||
@@ -272,12 +645,33 @@ jobs:
               ResponseBuffer buffer{{}, 4};
               require(append_response(buffer, "test", 4));
               require(!append_response(buffer, "!", 1) && buffer.exceeded && buffer.body == "test");
+              ResponseBuffer unlimited{{}, 0};
+              const std::string chunk(1024 * 1024, 'x');
+              for (int i = 0; i < 9; ++i) require(append_response(unlimited, chunk.data(), chunk.size()));
+              require(unlimited.body.size() == 9 * chunk.size() && !unlimited.exceeded);
+              require(decode_download("").empty());
+              require(decode_download("00aAFf") == std::vector<unsigned char>({0, 170, 255}));
+              std::string all_bytes;
+              const char* digits = "0123456789abcdef";
+              for (int i = 0; i < 256; ++i) { all_bytes += digits[i >> 4]; all_bytes += digits[i & 15]; }
+              const auto decoded = decode_download(all_bytes);
+              require(decoded.size() == 256);
+              for (int i = 0; i < 256; ++i) require(decoded[i] == i);
+              for (const auto& invalid : {std::string("0"), std::string("zz"), std::string("00\0f", 4)}) {
+                  bool rejected = false;
+                  try { decode_download(invalid); } catch (const std::invalid_argument&) { rejected = true; }
+                  require(rejected);
+              }
               require(!connection_address_allowed("127.0.0.1", 8080, true, true, false));
               std::cout << "Email flow and bounded-response regression tests passed\n";
               return 0;
           }
           }
           int main() {
+              if (application_binding_test::run() != 0) return 1;
+              if (string_lifetime_test::run() != 0) return 1;
+              if (local_data_test::run() != 0) return 1;
+              if (authentication_state_test::run() != 0) return 1;
               if (email_api_test::run() != 0) return 1;
               if (network_policy_test::run() != 0) return 1;
               if (response_headers_test::run() != 0) return 1;
@@ -290,10 +684,135 @@ jobs:
           '@ | Set-Content -LiteralPath $source
           $object = Join-Path $env:RUNNER_TEMP 'security-regression.obj'
           $executable = Join-Path $env:RUNNER_TEMP 'security-regression.exe'
-          & cl.exe /nologo /std:c++17 /EHsc /MD "/I$env:GITHUB_WORKSPACE" "/I$env:GITHUB_WORKSPACE\libsodium" $source "/Fo$object" "/Fe$executable" /link "$env:GITHUB_WORKSPACE\x64\Release\library_x64.lib" "$env:GITHUB_WORKSPACE\curl\zlib.lib" user32.lib shell32.lib
+          & cl.exe /nologo /std:c++17 /EHsc /guard:cf /guard:ehcont /MD "/I$env:GITHUB_WORKSPACE" "/I$env:GITHUB_WORKSPACE\libsodium" $source "/Fo$object" "/Fe$executable" /link /GUARD:CF /GUARD:EHCONT /CETCOMPAT "$env:GITHUB_WORKSPACE\x64\Release\library_x64.lib" "$env:GITHUB_WORKSPACE\curl\zlib.lib" user32.lib shell32.lib
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $executable
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          function Assert-ImportTable([byte[]]$image) {
+            $pe = [BitConverter]::ToInt32($image, 60)
+            $optional = $pe + 24
+            $optionalSize = [BitConverter]::ToUInt16($image, $pe + 20)
+            if ($optionalSize -lt 216 -or $optional -gt $image.Length - $optionalSize -or [BitConverter]::ToUInt16($image, $optional) -ne 0x20b) { throw 'Invalid x64 optional header.' }
+            if ([BitConverter]::ToUInt32($image, $optional + 108) -lt 13) { throw 'Import address directory is missing.' }
+            $iat = [uint64][BitConverter]::ToUInt32($image, $optional + 208)
+            $size = [uint64][BitConverter]::ToUInt32($image, $optional + 212)
+            if ($iat -eq 0 -or $size -lt 8 -or ($iat % 8) -ne 0 -or ($size % 8) -ne 0) { throw 'Invalid import address directory.' }
+            $count = [BitConverter]::ToUInt16($image, $pe + 6)
+            $table = $optional + $optionalSize
+            for ($i = 0; $i -lt $count; $i++) {
+              $section = $table + 40 * $i
+              $start = [uint64][BitConverter]::ToUInt32($image, $section + 12)
+              $length = [uint64][Math]::Max([BitConverter]::ToUInt32($image, $section + 8), [BitConverter]::ToUInt32($image, $section + 16))
+              if ($iat -ge $start -and $iat + $size -le $start + $length) {
+                $flags = [BitConverter]::ToUInt32($image, $section + 36)
+                if (($flags -band 0x40000000) -eq 0 -or ($flags -band 2684354560) -ne 0) { throw 'Import address table must be readable, non-writable and non-executable.' }
+                return $section
+              }
+            }
+            throw 'Import address table is outside image sections.'
+          }
+
+          function Assert-CodeSections([byte[]]$image) {
+            if ($image.Length -lt 64 -or [BitConverter]::ToUInt16($image, 0) -ne 0x5a4d) { throw 'Invalid DOS header.' }
+            $pe = [BitConverter]::ToInt32($image, 60)
+            if ($pe -lt 64 -or $pe -gt $image.Length - 24 -or [BitConverter]::ToUInt32($image, $pe) -ne 0x4550) { throw 'Invalid PE header.' }
+            $count = [BitConverter]::ToUInt16($image, $pe + 6)
+            $table = $pe + 24 + [BitConverter]::ToUInt16($image, $pe + 20)
+            if ($count -eq 0 -or $table -gt $image.Length - 40 * $count) { throw 'Invalid section table.' }
+            $text = -1
+            for ($i = 0; $i -lt $count; $i++) {
+              $section = $table + 40 * $i
+              $name = [Text.Encoding]::ASCII.GetString($image, $section, 8).TrimEnd([char]0)
+              $flags = [BitConverter]::ToUInt32($image, $section + 36)
+              if (($flags -band 0x20000000) -and ($flags -band 2147483648)) { throw 'Executable section is writable.' }
+              if ($name -eq '.text') {
+                if (($flags -band 0x60000000) -ne 0x60000000) { throw '.text must be readable and executable.' }
+                $text = $section
+              }
+            }
+            if ($text -lt 0) { throw '.text section was not found.' }
+            return $text
+          }
+          $image = [IO.File]::ReadAllBytes($executable)
+          $text = Assert-CodeSections $image
+          $iatSection = Assert-ImportTable $image
+          foreach ($unsafeFlag in @([uint64]2147483648, [uint64]536870912)) {
+            $invalidImports = [byte[]]$image.Clone()
+            $flags = [uint32]([uint64][BitConverter]::ToUInt32($invalidImports, $iatSection + 36) -bor $unsafeFlag)
+            [BitConverter]::GetBytes($flags).CopyTo($invalidImports, $iatSection + 36)
+            $rejected = $false
+            try { Assert-ImportTable $invalidImports | Out-Null } catch { $rejected = $true }
+            if (-not $rejected) { throw 'Unsafe import address table permissions were not detected.' }
+          }
+          Write-Output 'Read-only, non-executable import table checks passed'
+          $invalid = [byte[]]$image.Clone()
+          $flags = [uint32]([uint64][BitConverter]::ToUInt32($invalid, $text + 36) -bor 2147483648)
+          [BitConverter]::GetBytes($flags).CopyTo($invalid, $text + 36)
+          $rejected = $false
+          try { Assert-CodeSections $invalid | Out-Null } catch { $rejected = $true }
+          if (-not $rejected) { throw 'Writable executable section regression was not detected.' }
+          Write-Output 'Executable section hardening regression tests passed'
+
+          $previousHeader = & git show 'HEAD^:auth.hpp'
+          if ($LASTEXITCODE -ne 0) { throw 'Previous public header could not be read.' }
+          $previousHeader | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'auth-previous.hpp')
+          $abiSource = Join-Path $env:RUNNER_TEMP 'abi-regression.cpp'
+          @'
+          #define SODIUM_STATIC
+          #include "auth-previous.hpp"
+          #include <new>
+          #include <iostream>
+          int main() {
+              alignas(KeyAuth::api) unsigned char memory[sizeof(KeyAuth::api) + 32];
+              std::memset(memory, 0xa5, sizeof(memory));
+              auto* app = new (memory) KeyAuth::api("app", "1234567890", "1.0", "https://keyauth.win/api/1.3/", "");
+              app->enable_secure_strings();
+              if (!app->name.empty()) return 1;
+              app->enable_secure_strings(false);
+              if (app->name != "app" || app->authenticated()) return 2;
+              app->response.success = true;
+              app->response.isPaid = true;
+              if (app->authenticated(true)) return 3;
+              app->~api();
+              for (size_t i = sizeof(KeyAuth::api); i < sizeof(memory); ++i)
+                  if (memory[i] != 0xa5) return 4;
+              std::cout << "Previous-header consumer compatibility passed; object size " << sizeof(KeyAuth::api) << "\n";
+              return 0;
+          }
+          '@ | Set-Content -LiteralPath $abiSource
+          $abiObject = Join-Path $env:RUNNER_TEMP 'abi-regression.obj'
+          $abiExecutable = Join-Path $env:RUNNER_TEMP 'abi-regression.exe'
+          & cl.exe /nologo /std:c++17 /EHsc /guard:cf /guard:ehcont /MD /DNDEBUG "/I$env:GITHUB_WORKSPACE" "/I$env:GITHUB_WORKSPACE\libsodium" $abiSource "/Fo$abiObject" "/Fe$abiExecutable" /link /GUARD:CF /GUARD:EHCONT /CETCOMPAT "$env:GITHUB_WORKSPACE\x64\Release\library_x64.lib" "$env:GITHUB_WORKSPACE\curl\zlib.lib" user32.lib shell32.lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $abiExecutable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $xorHeader = [IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE 'xorstr.hpp'))
+          foreach ($variant in @(1, 2)) {
+            $time = if ($variant -eq 1) { '"00:00:01"' } else { '"00:00:02"' }
+            [IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP "xor-key$variant.hpp"), $xorHeader.Replace('__TIME__', $time))
+            $unit = '#include "xor-key' + $variant + '.hpp"' + "`n" + 'std::string xor_text_' + $variant + '() { return XorStr("linked-string-marker").str(); }'
+            $unit | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP "xor-unit$variant.cpp")
+          }
+          @'
+          #include <string>
+          #include <iostream>
+          std::string xor_text_1();
+          std::string xor_text_2();
+          int main() {
+              if (xor_text_1() != "linked-string-marker" || xor_text_2() != "linked-string-marker") return 1;
+              std::cout << "Mixed-key translation unit string regression tests passed\n";
+              return 0;
+          }
+          '@ | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'xor-main.cpp')
+          Push-Location $env:RUNNER_TEMP
+          try {
+            & cl.exe /nologo /std:c++17 /EHsc /MD /Od xor-unit1.cpp xor-unit2.cpp xor-main.cpp /Fe:xor-mixed.exe
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & ./xor-mixed.exe
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
 
       - name: collect build output
         shell: pwsh

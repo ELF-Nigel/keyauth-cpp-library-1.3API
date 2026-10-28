@@ -17,6 +17,20 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
+      - name: Verify dependency inputs
+        shell: pwsh
+        run: |
+          $dependencies = @(
+            @('curl/libcurl.lib', 'ce95938a2ab28c117c060d0d230627e4394f2816e6bf0278582f4cc16f5252ff', 'https://curl.se/download/curl-8.23.0.zip', '85477fe11408471285f38a601e7c6f53470d13be9a5a316919b071ad02e68213'),
+            @('curl/zlib.lib', 'cb8f44532898db105798fcfa2e063ead4b4488ff9806782a8d3d0f410014e8c6', 'https://zlib.net/zlib132.zip', 'e8bf55f3017aa181690990cb58a994e77885da140609fc8f94abe9b65d2cae28'),
+            @('libsodium/libsodium.lib', '975fe3ea19d4c78ae8b3ac12fc9212063fea7edadbb6307f089f52febdafa371', 'https://download.libsodium.org/libsodium/releases/libsodium-1.0.20-stable-msvc.zip', 'ebaa204fdfcedc51dc1ee1bbd03c8d552a14b3372f87f94e44c71a8533f77df4')
+          )
+          foreach ($dependency in $dependencies) {
+            $actual = (Get-FileHash -LiteralPath $dependency[0] -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -cne $dependency[1]) { throw "Unexpected dependency binary: $($dependency[0])" }
+            Write-Output "Verified $($dependency[0]); upstream archive $($dependency[2]); source SHA256 $($dependency[3])"
+          }
+
       - name: Build library_x64.lib (Release|x64)
         run: >
           msbuild .\library.vcxproj

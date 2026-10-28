@@ -16,6 +16,7 @@
 
 #include <auth.hpp>
 #include <dpapi.h>
+#include <lmcons.h>
 #pragma comment(lib, "crypt32.lib")
 #include <strsafe.h> 
 #include <windows.h>
@@ -43,6 +44,8 @@
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "dnsapi.lib")
+#pragma comment(lib, "secur32.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 #include <cstdio>
 #include <iostream>
@@ -93,9 +96,8 @@
 
 #define SHA256_HASH_SIZE 32
 
-static std::string hexDecode(const std::string& hex);
 std::string get_str_between_two_str(const std::string& s, const std::string& start_delim, const std::string& stop_delim);
-int VerifyPayload(std::string signature, std::string timestamp, std::string body);
+int VerifyPayload(const std::string& signature, const std::string& timestamp, const std::string& body, long long received_at = 0);
 
 std::string checksum();
 [[noreturn]] void error(std::string message);
@@ -236,6 +238,103 @@ static inline void securewipe(std::string& value) noexcept
     secure_zero(value);
 }
 
+struct LocalHttpResources final {
+    bool initialized = false;
+    HTTP_SERVER_SESSION_ID session = 0;
+    HTTP_URL_GROUP_ID group = 0;
+    HANDLE queue = nullptr;
+    LocalHttpResources() = default;
+    LocalHttpResources(const LocalHttpResources&) = delete;
+    LocalHttpResources& operator=(const LocalHttpResources&) = delete;
+    ~LocalHttpResources() noexcept {
+        if (group) HttpCloseUrlGroup(group);
+        if (queue) HttpCloseRequestQueue(queue);
+        if (session) HttpCloseServerSession(session);
+        if (initialized) HttpTerminate(HTTP_INITIALIZE_SERVER, nullptr);
+    }
+};
+
+struct ScopeWipe final {
+    std::string* value;
+    explicit ScopeWipe(std::string& v) noexcept : value(&v) {}
+    ~ScopeWipe() noexcept { securewipe(*value); }
+};
+
+static std::string transform_saved_data(const std::string& input, bool encrypt)
+{
+    if (input.size() > MAXDWORD) throw KeyAuth::request_error("Local data exceeds the Windows protection limit.");
+    DATA_BLOB in{static_cast<DWORD>(input.size()),
+        reinterpret_cast<BYTE*>(const_cast<char*>(input.data()))};
+    struct Output final {
+        DATA_BLOB blob{};
+        ~Output() {
+            if (blob.pbData) {
+                SecureZeroMemory(blob.pbData, blob.cbData);
+                LocalFree(blob.pbData);
+            }
+        }
+    } out;
+    const BOOL ok = encrypt ?
+        CryptProtectData(&in, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out.blob) :
+        CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out.blob);
+    if (!ok) throw KeyAuth::request_error("Windows could not protect or unlock local data for this account.");
+    if (!out.blob.cbData) return {};
+    return std::string(reinterpret_cast<const char*>(out.blob.pbData), out.blob.cbData);
+}
+
+std::string KeyAuth::api::protect_data(const std::string& data)
+{
+    constexpr size_t digest_size = crypto_generichash_BYTES;
+    if (data.size() > MAXDWORD - 8 - digest_size)
+        throw request_error("Local data exceeds the Windows protection limit.");
+    if (sodium_init() < 0) throw request_error("Local data integrity initialization failed.");
+    std::string plain("KA-DATA1", 8);
+    ScopeWipe wipe_plain(plain);
+    plain += data;
+    const auto digest_offset = plain.size();
+    plain.resize(digest_offset + digest_size);
+    if (crypto_generichash(reinterpret_cast<unsigned char*>(plain.data() + digest_offset), digest_size,
+        reinterpret_cast<const unsigned char*>(data.data()), data.size(), nullptr, 0) != 0)
+        throw request_error("Local data integrity calculation failed.");
+    std::string encrypted = transform_saved_data(plain, true);
+    ScopeWipe wipe_encrypted(encrypted);
+    const std::string prefix = "keyauth:dpapi:v1:";
+    if (encrypted.size() > (std::string().max_size() - prefix.size()) / 2)
+        throw request_error("Protected local data exceeds the string limit.");
+    return prefix + bytes_to_hex(reinterpret_cast<const unsigned char*>(encrypted.data()), encrypted.size());
+}
+
+std::string KeyAuth::api::unprotect_data(const std::string& data)
+{
+    const std::string prefix = "keyauth:dpapi:v1:";
+    if (data.compare(0, prefix.size(), prefix) != 0 || data.size() <= prefix.size())
+        throw request_error("Unsupported protected local data format.");
+    const auto encoded_size = data.size() - prefix.size();
+    if (encoded_size % 2 || encoded_size / 2 > MAXDWORD)
+        throw request_error("Invalid protected local data length.");
+    if (sodium_init() < 0) throw request_error("Local data integrity initialization failed.");
+    std::string encrypted(encoded_size / 2, '\0');
+    ScopeWipe wipe_encrypted(encrypted);
+    size_t decoded = 0;
+    if (sodium_hex2bin(reinterpret_cast<unsigned char*>(encrypted.data()), encrypted.size(),
+        data.data() + prefix.size(), encoded_size, nullptr, &decoded, nullptr) != 0 || decoded != encrypted.size())
+        throw request_error("Invalid protected local data encoding.");
+    std::string plain = transform_saved_data(encrypted, false);
+    ScopeWipe wipe_plain(plain);
+    constexpr size_t digest_size = crypto_generichash_BYTES;
+    if (plain.size() < 8 + digest_size || plain.compare(0, 8, "KA-DATA1") != 0)
+        throw request_error("Invalid protected local data envelope.");
+    const auto size = plain.size() - 8 - digest_size;
+    unsigned char digest[digest_size]{};
+    if (crypto_generichash(digest, sizeof(digest),
+        reinterpret_cast<const unsigned char*>(plain.data() + 8), size, nullptr, 0) != 0)
+        throw request_error("Local data integrity calculation failed.");
+    const bool valid = sodium_memcmp(digest, plain.data() + 8 + size, sizeof(digest)) == 0;
+    SecureZeroMemory(digest, sizeof(digest));
+    if (!valid) throw request_error("Protected local data failed its integrity check.");
+    return plain.substr(8, size);
+}
+
 static uint64_t fnv1a64_bytes(const uint8_t* data, size_t len)
 {
     uint64_t h = 0xcbf29ce484222325ULL;
@@ -339,50 +438,112 @@ void KeyAuth::api::enable_secure_strings(bool enable)
     }
 }
 
+std::string KeyAuth::api::initialization_context() const
+{
+    return keyauth_detail::application_identity(get_ownerid(), get_name(), get_url());
+}
+
+void KeyAuth::api::bind_initialization_context()
+{
+    std::string identity = initialization_context();
+    ScopeWipe wipe(identity);
+    initialized_context_ = protect_field(identity, true);
+}
+
+bool KeyAuth::api::initialization_context_valid() const
+{
+    if (!initialized) return true;
+    if (initialized_context_.empty()) return false;
+    try {
+        std::string expected = protect_field(initialized_context_, false);
+        ScopeWipe wipe_expected(expected);
+        std::string actual = initialization_context();
+        ScopeWipe wipe_actual(actual);
+        return expected == actual;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 uint64_t KeyAuth::api::compute_auth_seal(uint64_t nonce, long long window) const
 {
     const std::string hwid = utils::get_hwid();
     std::string material;
+    ScopeWipe wipe_material(material);
     material.reserve(256);
-    material += get_ownerid();
-    material += '|';
-    material += get_name();
-    material += '|';
-    material += sessionid;
-    material += '|';
-    material += user_data.username;
-    material += '|';
-    material += hwid;
-    material += '|';
-    material += std::to_string(GetCurrentProcessId());
-    material += '|';
-    material += std::to_string(reinterpret_cast<uintptr_t>(this));
-    material += '|';
-    material += std::to_string(nonce);
-    material += '|';
-    material += std::to_string(window);
+    const auto append = [&material](const std::string& field) {
+        material += std::to_string(field.size());
+        material += ':';
+        material += field;
+    };
+    append(get_ownerid());
+    append(get_name());
+    append(sessionid);
+    append(user_data.username);
+    append(hwid);
+    append(std::to_string(GetCurrentProcessId()));
+    append(std::to_string(reinterpret_cast<uintptr_t>(this)));
+    append(std::to_string(nonce));
+    append(std::to_string(window));
+    append(enckey);
+    append(initialized_context_);
+    struct ScopedKey final {
+        std::array<unsigned char, crypto_shorthash_KEYBYTES> value;
+        ~ScopedKey() { SecureZeroMemory(value.data(), value.size()); }
+    } key{auth_seal_key_};
+    if (!CryptUnprotectMemory(key.value.data(), static_cast<DWORD>(key.value.size()),
+        CRYPTPROTECTMEMORY_SAME_PROCESS))
+        throw request_error("Windows authentication key protection failed.");
     uint64_t seal = 0;
     const int status = crypto_shorthash(reinterpret_cast<unsigned char*>(&seal),
-        reinterpret_cast<const unsigned char*>(material.data()), material.size(), auth_seal_key_.data());
+        reinterpret_cast<const unsigned char*>(material.data()), material.size(), key.value.data());
     secure_zero(material);
     if (status != 0) throw request_error("Authentication state verification failed.");
     return seal;
 }
 
+void KeyAuth::api::store_auth_entitlements(bool reset_profile)
+{
+    nlohmann::json state;
+    if (reset_profile) {
+        state["subscriptions"] = nlohmann::json::array();
+        for (const auto& sub : user_data.subscriptions)
+            state["subscriptions"].push_back({{"name", sub.name}, {"expiry", sub.expiry}});
+    } else {
+        std::string plain = protect_field(enckey, false);
+        ScopeWipe wipe_plain(plain);
+        state = nlohmann::json::parse(plain);
+    }
+    state["paid"] = response.isPaid;
+    std::string plain = state.dump();
+    ScopeWipe wipe_plain(plain);
+    std::string protected_state = protect_field(plain, true);
+    secure_zero(enckey);
+    enckey = std::move(protected_state);
+}
+
 bool KeyAuth::api::has_active_subscription() const
 {
-    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    for (const auto& sub : user_data.subscriptions) {
-        if (sub.name.empty() || sub.expiry.empty())
-            continue;
-        try {
-            if (std::stoll(sub.expiry) > now) {
-                return true;
+    try {
+        std::string plain = protect_field(enckey, false);
+        ScopeWipe wipe_plain(plain);
+        const auto state = nlohmann::json::parse(plain);
+        if (state.value("paid", false)) return true;
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        for (const auto& sub : state.at("subscriptions")) {
+            const auto name = sub.at("name").get<std::string>();
+            const auto expiry = sub.at("expiry").get<std::string>();
+            if (name.empty() || expiry.empty()) continue;
+            try {
+                size_t consumed = 0;
+                const auto expiration = std::stoll(expiry, &consumed);
+                if (consumed == expiry.size() && expiration > now) return true;
+            } catch (const std::invalid_argument&) {
+            } catch (const std::out_of_range&) {
             }
         }
-        catch (...) {
-        }
+    } catch (const std::exception&) {
     }
     return false;
 }
@@ -391,6 +552,7 @@ void KeyAuth::api::reset_auth_runtime()
 {
     LoggedIn.store(false);
     auth_nonce_.store(0);
+    secure_zero(enckey);
     SecureZeroMemory(auth_seal_key_.data(), auth_seal_key_.size());
     auth_window_.store(0);
     auth_seal_.store(0);
@@ -400,25 +562,33 @@ void KeyAuth::api::reset_auth_runtime()
 
 void KeyAuth::api::mark_authenticated()
 {
-    uint64_t nonce = 0;
-    do {
-        if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&nonce), sizeof(nonce),
+    try {
+        uint64_t nonce = 0;
+        do {
+            if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&nonce), sizeof(nonce),
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+                reset_auth_runtime();
+                throw request_error("Windows cryptographic random generation failed.");
+            }
+        } while (nonce == 0);
+        if (BCryptGenRandom(nullptr, auth_seal_key_.data(), static_cast<ULONG>(auth_seal_key_.size()),
             BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
             reset_auth_runtime();
             throw request_error("Windows cryptographic random generation failed.");
         }
-    } while (nonce == 0);
-    if (BCryptGenRandom(nullptr, auth_seal_key_.data(), static_cast<ULONG>(auth_seal_key_.size()),
-        BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+        if (!CryptProtectMemory(auth_seal_key_.data(), static_cast<DWORD>(auth_seal_key_.size()),
+            CRYPTPROTECTMEMORY_SAME_PROCESS))
+            throw request_error("Windows authentication key protection failed.");
+        store_auth_entitlements(true);
+        const auto window = keyauth_detail::auth_window_now();
+        auth_nonce_.store(nonce);
+        auth_window_.store(window);
+        auth_seal_.store(compute_auth_seal(nonce, window));
+        LoggedIn.store(true);
+    } catch (...) {
         reset_auth_runtime();
-        throw request_error("Windows cryptographic random generation failed.");
+        throw;
     }
-    const auto window = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count() / 90;
-    auth_nonce_.store(nonce);
-    auth_window_.store(window);
-    auth_seal_.store(compute_auth_seal(nonce, window));
-    LoggedIn.store(true);
 }
 
 void KeyAuth::api::refresh_auth_runtime()
@@ -428,8 +598,8 @@ void KeyAuth::api::refresh_auth_runtime()
     const uint64_t nonce = auth_nonce_.load();
     if (nonce == 0)
         return;
-    const auto window = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count() / 90;
+    const auto window = keyauth_detail::auth_window_now();
+    store_auth_entitlements(false);
     auth_window_.store(window);
     auth_seal_.store(compute_auth_seal(nonce, window));
 }
@@ -442,7 +612,7 @@ bool KeyAuth::api::authenticated(bool require_paid) const
 
 bool KeyAuth::api::local_auth_valid(bool require_paid, bool require_fresh) const
 {
-    if (!LoggedIn.load())
+    if (!LoggedIn.load() || !initialization_context_valid())
         return false;
     if (sessionid.empty() || user_data.username.empty())
         return false;
@@ -453,15 +623,19 @@ bool KeyAuth::api::local_auth_valid(bool require_paid, bool require_fresh) const
     if (nonce == 0 || sealed_window == 0 || sealed == 0)
         return false;
 
-    const uint64_t expected = compute_auth_seal(nonce, sealed_window);
+    uint64_t expected = 0;
+    try {
+        expected = compute_auth_seal(nonce, sealed_window);
+    } catch (const request_error&) {
+        return false;
+    }
     if (sodium_memcmp(&expected, &sealed, sizeof(sealed)) != 0)
         return false;
-    const auto current_window = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count() / 90;
+    const auto current_window = keyauth_detail::auth_window_now();
     if (require_fresh && !keyauth_detail::auth_window_fresh(sealed_window, current_window))
         return false;
 
-    if (require_paid && !has_active_subscription() && !response.isPaid)
+    if (require_paid && !has_active_subscription())
         return false;
 
     return true;
@@ -623,16 +797,14 @@ static bool module_contains_ascii(const std::string& needle)
     return false;
 }
 
-struct ScopeWipe final {
-    std::string* value;
-    explicit ScopeWipe(std::string& v) noexcept : value(&v) {}
-    ~ScopeWipe() noexcept { securewipe(*value); }
-};
-
 void KeyAuth::api::init()
 {
     std::lock_guard<std::recursive_mutex> api_lock(api_mutex_);
-    if (initialized) return;
+    if (initialized) {
+        if (!initialization_context_valid()) throw request_error("Application configuration changed after initialization. Create a new API instance.");
+        return;
+    }
+    secure_zero(initialized_context_);
     static const CURLcode curl_init_result = curl_global_init(CURL_GLOBAL_DEFAULT);
     if (curl_init_result != CURLE_OK) throw request_error("CURL global initialization failed.");
     (void)get_public_key_hex();
@@ -649,6 +821,7 @@ void KeyAuth::api::init()
         XorStr("&hash=") + curl_escape(nullptr, hash) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
     // to ensure people removed secret from main.cpp (some people will forget to)
     const std::string resolved_path = get_path();
     if (resolved_path.find("https") != std::string::npos) {
@@ -666,6 +839,7 @@ void KeyAuth::api::init()
         std::ifstream file(resolved_path);
         std::string token;
         std::string thash;
+        ScopeWipe wipe_token(token);
         std::getline(file, token);
 
         thash = keyauth_detail::file_md5(std::filesystem::path(resolved_path));
@@ -675,6 +849,7 @@ void KeyAuth::api::init()
     }
 
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
 
     if (response == XorStr("KeyAuth_Invalid").c_str()) {
         MessageBoxA(0, XorStr("Application not found. Please copy strings directly from dashboard.").c_str(), NULL, MB_ICONERROR);
@@ -708,9 +883,9 @@ void KeyAuth::api::init()
                     Sleep(100);
                 }
                 sessionid = json[(XorStr("sessionid"))];
-                authenticated_host_ = keyauth_detail::parse_api_endpoint(get_url()).host;
-                initialized = true;
+                bind_initialization_context();
                 load_app_data(json[(XorStr("appinfo"))]);
+                initialized = true;
             }
             else if (json[(XorStr("message"))] == XorStr("invalidver"))
             {
@@ -773,7 +948,9 @@ void KeyAuth::api::login(std::string username, std::string password, std::string
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
     //std::cout << "[DEBUG] Login response: " << response << std::endl;
     std::hash<int> hasher;
     int expectedHash = hasher(42);
@@ -820,7 +997,8 @@ void KeyAuth::api::login(std::string username, std::string password, std::string
 nlohmann::json KeyAuth::api::email_reply(std::string data)
 {
     ScopeWipe wipe(data);
-    const auto raw = req(data, get_url());
+    auto raw = req(data, get_url());
+    ScopeWipe wipe_raw(raw);
     auto reply = nlohmann::json::parse(raw, nullptr, false);
     try {
         keyauth_detail::validate_api_reply(reply, get_ownerid());
@@ -960,8 +1138,10 @@ void KeyAuth::api::chatget(std::string channel)
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
 
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
     auto json = response_decoder.parse(response);
     load_channel_data(json);
 }
@@ -980,8 +1160,10 @@ bool KeyAuth::api::chatsend(std::string message, std::string channel)
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
 
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
     auto json = response_decoder.parse(response);
     load_response_data(json);
     return json[XorStr("success")];
@@ -999,8 +1181,10 @@ void KeyAuth::api::changeUsername(std::string newusername)
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
 
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
     std::hash<int> hasher;
     int expectedHash = hasher(42);
     int result = VerifyPayload(signature, signatureTimestamp, response);
@@ -1043,8 +1227,10 @@ KeyAuth::api::Tfa& KeyAuth::api::enable2fa(std::string code)
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
 
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
     auto json = response_decoder.parse(response);
 
     if (json.contains("2fa")) {
@@ -1078,8 +1264,10 @@ KeyAuth::api::Tfa& KeyAuth::api::disable2fa(std::string code)
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
 
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
 
     auto json = response_decoder.parse(response);
 
@@ -1138,9 +1326,11 @@ void KeyAuth::api::web_login()
     // from https://perpetualprogrammers.wordpress.com/2016/05/22/the-http-server-api/
 
     // Initialize the API.
+    LocalHttpResources listener;
     ULONG result = 0;
     HTTPAPI_VERSION version = HTTPAPI_VERSION_2;
     result = HttpInitialize(version, HTTP_INITIALIZE_SERVER, 0);
+    listener.initialized = result == NO_ERROR;
 
     if (result == ERROR_INVALID_PARAMETER) {
         MessageBoxA(NULL, "The Flags parameter contains an unsupported value.", "Error", MB_ICONEXCLAMATION);
@@ -1152,7 +1342,7 @@ void KeyAuth::api::web_login()
     }
 
     // Create server session.
-    HTTP_SERVER_SESSION_ID serverSessionId;
+    auto& serverSessionId = listener.session;
     result = HttpCreateServerSession(version, &serverSessionId, 0);
 
     if (result == ERROR_REVISION_MISMATCH) {
@@ -1171,7 +1361,7 @@ void KeyAuth::api::web_login()
     }
 
     // Create URL group.
-    HTTP_URL_GROUP_ID groupId;
+    auto& groupId = listener.group;
     result = HttpCreateUrlGroup(serverSessionId, &groupId, 0);
 
     if (result == ERROR_INVALID_PARAMETER) {
@@ -1185,7 +1375,7 @@ void KeyAuth::api::web_login()
     }
 
     // Create request queue.
-    HANDLE requestQueueHandle;
+    auto& requestQueueHandle = listener.queue;
     result = HttpCreateRequestQueue(version, NULL, NULL, 0, &requestQueueHandle);
 
     if (result == ERROR_REVISION_MISMATCH) {
@@ -1219,7 +1409,7 @@ void KeyAuth::api::web_login()
     }
 
     // Attach request queue to URL group.
-    HTTP_BINDING_INFO info;
+    HTTP_BINDING_INFO info{};
     info.Flags.Present = 1;
     info.RequestQueueHandle = requestQueueHandle;
     result = HttpSetUrlGroupProperty(groupId, HttpServerBindingProperty, &info, sizeof(info));
@@ -1273,12 +1463,12 @@ void KeyAuth::api::web_login()
         // Wait for a request.
         HTTP_REQUEST_ID requestId = 0;
         HTTP_SET_NULL_ID(&requestId);
-        int bufferSize = 4096;
+        int bufferSize = 64 * 1024;
         int requestSize = sizeof(HTTP_REQUEST) + bufferSize;
         auto buffer = std::make_unique<BYTE[]>(requestSize);
         PHTTP_REQUEST pRequest = (PHTTP_REQUEST)buffer.get();
         RtlZeroMemory(buffer.get(), requestSize);
-        ULONG bytesReturned;
+        ULONG bytesReturned = 0;
         result = HttpReceiveHttpRequest(
             requestQueueHandle,
             requestId,
@@ -1288,16 +1478,33 @@ void KeyAuth::api::web_login()
             &bytesReturned,
             NULL
         );
+        if (result == ERROR_MORE_DATA) {
+            if (pRequest->RequestId) HttpCancelHttpRequest(requestQueueHandle, pRequest->RequestId, nullptr);
+            continue;
+        }
+        if (result == ERROR_CONNECTION_INVALID || result == ERROR_HANDLE_EOF) continue;
+        if (result != NO_ERROR)
+            throw request_error("Local HTTP request reception failed (code " + std::to_string(result) + ").");
 
         // Display some information about the request.
         // wprintf(L"Full URL: %ws\n", pRequest->CookedUrl.pFullUrl);
         // wprintf(L"    Path: %ws\n", pRequest->CookedUrl.pAbsPath);
         // wprintf(L"    Query: %ws\n", pRequest->CookedUrl.pQueryString);
 
-        std::wstring ws(pRequest->CookedUrl.pQueryString);
+        std::wstring ws;
+        try {
+            ws = keyauth_detail::bounded_http_query(pRequest->CookedUrl.pQueryString,
+                pRequest->CookedUrl.QueryStringLength, buffer.get(), requestSize);
+        } catch (const std::invalid_argument&) {
+            HttpCancelHttpRequest(requestQueueHandle, pRequest->RequestId, nullptr);
+            continue;
+        }
         std::string myVarS = std::string(ws.begin(), ws.end());
+        ScopeWipe wipe_query(myVarS);
         std::string user = get_str_between_two_str(myVarS, "?user=", "&");
         std::string token = get_str_between_two_str(myVarS, "&token=", "");
+        ScopeWipe wipe_token(token);
+        ScopeWipe wipe_user(user);
 
         // std::cout << get_str_between_two_str(CW2A(pRequest->CookedUrl.pQueryString), "?", "&") << std::endl;
 
@@ -1309,7 +1516,7 @@ void KeyAuth::api::web_login()
             RtlZeroMemory(&response, sizeof(response));
 
             response.StatusCode = 200;
-            response.pReason = static_cast<PCSTR>(XorStr("OK").c_str());
+            response.pReason = "OK";
             response.ReasonLength = (USHORT)strlen(response.pReason);
 
             // https://social.msdn.microsoft.com/Forums/vstudio/en-US/6d468747-2221-4f4a-9156-f98f355a9c08/using-httph-to-set-up-an-https-server-that-is-queried-by-a-client-that-uses-cross-origin-requests?forum=vcgeneral
@@ -1343,6 +1550,11 @@ void KeyAuth::api::web_login()
             continue;
         }
 
+        if (user.empty() || token.empty()) {
+            HttpCancelHttpRequest(requestQueueHandle, pRequest->RequestId, nullptr);
+            continue;
+        }
+
         // keyauth request
         std::string hwid = utils::get_hwid();
         auto data =
@@ -1353,7 +1565,9 @@ void KeyAuth::api::web_login()
             XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
             XorStr("&name=") + curl_escape(nullptr, get_name()) +
             XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+        ScopeWipe wipe_request_data(data);
         auto resp = req(data, get_url());
+        ScopeWipe wipe_response_body(resp);
 
         std::hash<int> hasher;
         int expectedHash = hasher(42);
@@ -1385,19 +1599,21 @@ void KeyAuth::api::web_login()
                 HTTP_RESPONSE response;
                 RtlZeroMemory(&response, sizeof(response));
 
+                std::string response_reason;
                 bool success = true;
                 if (json[(XorStr("success"))])
                 {
                     load_user_data(json[(XorStr("info"))]);
 
                     response.StatusCode = 420;
-                    response.pReason = XorStr("SHEESH").c_str();
+                    response.pReason = "SHEESH";
                     response.ReasonLength = (USHORT)strlen(response.pReason);
                 }
                 else
                 {
                     response.StatusCode = 200;
-                    response.pReason = static_cast<std::string>(json[(XorStr("message"))]).c_str();
+                    response_reason = keyauth_detail::http_reason(json.at("message").get<std::string>());
+                    response.pReason = response_reason.c_str();
                     response.ReasonLength = (USHORT)strlen(response.pReason);
                     success = false;
                 }
@@ -1457,27 +1673,34 @@ void KeyAuth::api::button(std::string button)
     // from https://perpetualprogrammers.wordpress.com/2016/05/22/the-http-server-api/
 
     // Initialize the API.
+    LocalHttpResources listener;
     ULONG result = 0;
     HTTPAPI_VERSION version = HTTPAPI_VERSION_2;
     result = HttpInitialize(version, HTTP_INITIALIZE_SERVER, 0);
+    listener.initialized = result == NO_ERROR;
+    if (result != NO_ERROR) throw request_error("Local HTTP listener setup failed (code " + std::to_string(result) + ").");
 
     // Create server session.
-    HTTP_SERVER_SESSION_ID serverSessionId;
+    auto& serverSessionId = listener.session;
     result = HttpCreateServerSession(version, &serverSessionId, 0);
+    if (result != NO_ERROR) throw request_error("Local HTTP listener setup failed (code " + std::to_string(result) + ").");
 
     // Create URL group.
-    HTTP_URL_GROUP_ID groupId;
+    auto& groupId = listener.group;
     result = HttpCreateUrlGroup(serverSessionId, &groupId, 0);
+    if (result != NO_ERROR) throw request_error("Local HTTP listener setup failed (code " + std::to_string(result) + ").");
 
     // Create request queue.
-    HANDLE requestQueueHandle;
+    auto& requestQueueHandle = listener.queue;
     result = HttpCreateRequestQueue(version, NULL, NULL, 0, &requestQueueHandle);
+    if (result != NO_ERROR) throw request_error("Local HTTP listener setup failed (code " + std::to_string(result) + ").");
 
     // Attach request queue to URL group.
-    HTTP_BINDING_INFO info;
+    HTTP_BINDING_INFO info{};
     info.Flags.Present = 1;
     info.RequestQueueHandle = requestQueueHandle;
     result = HttpSetUrlGroupProperty(groupId, HttpServerBindingProperty, &info, sizeof(info));
+    if (result != NO_ERROR) throw request_error("Local HTTP listener setup failed (code " + std::to_string(result) + ").");
 
     // Add URLs to URL group.
     std::wstring output;
@@ -1485,6 +1708,7 @@ void KeyAuth::api::button(std::string button)
     output = std::wstring(L"http://localhost:1337/") + output;
     PCWSTR url = output.c_str();
     result = HttpAddUrlToUrlGroup(groupId, url, 0, 0);
+    if (result != NO_ERROR) throw request_error("Local HTTP listener setup failed (code " + std::to_string(result) + ").");
 
     // Announce that it is running.
     // wprintf(L"Listening. Please submit requests to: %s\n", url);
@@ -1496,12 +1720,12 @@ void KeyAuth::api::button(std::string button)
         // Wait for a request.
         HTTP_REQUEST_ID requestId = 0;
         HTTP_SET_NULL_ID(&requestId);
-        int bufferSize = 4096;
+        int bufferSize = 64 * 1024;
         int requestSize = sizeof(HTTP_REQUEST) + bufferSize;
         auto buffer = std::make_unique<BYTE[]>(requestSize);
         PHTTP_REQUEST pRequest = (PHTTP_REQUEST)buffer.get();
         RtlZeroMemory(buffer.get(), requestSize);
-        ULONG bytesReturned;
+        ULONG bytesReturned = 0;
         result = HttpReceiveHttpRequest(
             requestQueueHandle,
             requestId,
@@ -1511,6 +1735,13 @@ void KeyAuth::api::button(std::string button)
             &bytesReturned,
             NULL
         );
+        if (result == ERROR_MORE_DATA) {
+            if (pRequest->RequestId) HttpCancelHttpRequest(requestQueueHandle, pRequest->RequestId, nullptr);
+            continue;
+        }
+        if (result == ERROR_CONNECTION_INVALID || result == ERROR_HANDLE_EOF) continue;
+        if (result != NO_ERROR)
+            throw request_error("Local HTTP request reception failed (code " + std::to_string(result) + ").");
 
         going = false;
 
@@ -1532,7 +1763,7 @@ void KeyAuth::api::button(std::string button)
         HTTP_RESPONSE response;
         RtlZeroMemory(&response, sizeof(response));
         response.StatusCode = 420;
-        response.pReason = XorStr("SHEESH").c_str();
+        response.pReason = "SHEESH";
         response.ReasonLength = (USHORT)strlen(response.pReason);
 
         // https://social.msdn.microsoft.com/Forums/vstudio/en-US/6d468747-2221-4f4a-9156-f98f355a9c08/using-httph-to-set-up-an-https-server-that-is-queried-by-a-client-that-uses-cross-origin-requests?forum=vcgeneral
@@ -1585,7 +1816,9 @@ void KeyAuth::api::regstr(std::string username, std::string password, std::strin
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
 
     std::hash<int> hasher;
     int expectedHash = hasher(42);
@@ -1641,7 +1874,9 @@ void KeyAuth::api::upgrade(std::string username, std::string key) {
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
 
     std::hash<int> hasher;
     int expectedHash = hasher(42);
@@ -1702,7 +1937,9 @@ void KeyAuth::api::license(std::string key, std::string code) {
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
 
     std::hash<int> hasher;
     int expectedHash = hasher(42);
@@ -1756,7 +1993,9 @@ void KeyAuth::api::setvar(std::string var, std::string vardata) {
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
     auto json = response_decoder.parse(response);
     load_response_data(json);
 }
@@ -1772,7 +2011,9 @@ std::string KeyAuth::api::getvar(std::string var) {
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
 
     std::hash<int> hasher;
     int expectedHash = hasher(42);
@@ -1814,7 +2055,9 @@ void KeyAuth::api::ban(std::string reason) {
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
 
     std::hash<int> hasher;
     int expectedHash = hasher(42);
@@ -1856,7 +2099,9 @@ bool KeyAuth::api::checkblack() {
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
 
     std::hash<int> hasher;
     int expectedHash = hasher(42);
@@ -1888,7 +2133,7 @@ void KeyAuth::api::check(bool check_paid) {
     std::lock_guard<std::recursive_mutex> api_lock(api_mutex_);
     checkInit();
 
-    if (LoggedIn.load() && !local_auth_valid(check_paid, false)) {
+    if (LoggedIn.load() && !local_auth_valid(false, false)) {
         reset_auth_runtime();
         return;
     }
@@ -1898,13 +2143,16 @@ void KeyAuth::api::check(bool check_paid) {
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
 
     std::string endpoint = get_url();
     if (check_paid) {
-        endpoint += "?check_paid=1";
+        endpoint += (endpoint.find('?') == std::string::npos ? "?" : "&");
+        endpoint += "check_paid=1";
     }
 
     auto response = req(data, endpoint);
+    ScopeWipe wipe_response_body(response);
 
     std::hash<int> hasher;
     int expectedHash = hasher(42);
@@ -1951,7 +2199,9 @@ std::string KeyAuth::api::var(std::string varid) {
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
 
     std::hash<int> hasher;
     int expectedHash = hasher(42);
@@ -1987,10 +2237,13 @@ void KeyAuth::api::log(std::string message) {
     checkInit();
     ScopeWipe wipe_message(message);
 
-    char acUserName[100];
+    char acUserName[UNLEN + 1]{};
     DWORD nUserName = sizeof(acUserName);
-    GetUserNameA(acUserName, &nUserName);
-    std::string UsernamePC = acUserName;
+    std::string UsernamePC;
+    if (GetUserNameA(acUserName, &nUserName) && nUserName > 0 && nUserName <= sizeof(acUserName))
+        UsernamePC.assign(acUserName, nUserName - 1);
+    SecureZeroMemory(acUserName, sizeof(acUserName));
+    ScopeWipe wipe_pcuser(UsernamePC);
 
     auto data =
         XorStr("type=log") +
@@ -1999,6 +2252,7 @@ void KeyAuth::api::log(std::string message) {
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
 
     req(data, get_url());
 }
@@ -2008,18 +2262,16 @@ std::vector<unsigned char> KeyAuth::api::download(std::string fileid) {
     checkInit();
     ScopeWipe wipe_fileid(fileid);
 
-    auto to_uc_vector = [](std::string value) {
-        return std::vector<unsigned char>(value.data(), value.data() + value.length() );
-    };
-
     auto data =
         XorStr("type=file") +
         XorStr("&fileid=") + curl_escape(nullptr, fileid) +
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
 
     auto reply = req(data, get_url());
+    ScopeWipe wipe_reply(reply);
     auto json = nlohmann::json::parse(reply, nullptr, false);
     if (json.is_discarded() || !json.is_object()) {
         response.success = false;
@@ -2031,12 +2283,13 @@ std::vector<unsigned char> KeyAuth::api::download(std::string fileid) {
         response.success = false;
         throw request_error("Download response has no contents field.");
     }
-    const auto contents = json["contents"].get<std::string>();
+    auto& contents = json["contents"].get_ref<std::string&>();
+    ScopeWipe wipe_contents(contents);
     if (contents.size() % 2 || (!contents.empty() && !is_hex_string(contents))) {
         response.success = false;
         throw request_error("Download contents are not valid hexadecimal data.");
     }
-    return to_uc_vector(hexDecode(contents));
+    return keyauth_detail::decode_download(contents);
 }
 
 
@@ -2058,7 +2311,9 @@ std::string KeyAuth::api::webhook(std::string id, std::string params, std::strin
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
 
     std::hash<int> hasher;
     int expectedHash = hasher(42);
@@ -2100,8 +2355,10 @@ std::string KeyAuth::api::fetchonline()
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
 
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
 
     std::hash<int> hasher;
     int expectedHash = hasher(42);
@@ -2149,8 +2406,10 @@ void KeyAuth::api::fetchstats()
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
 
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
     std::hash<int> hasher;
     int expectedHash = hasher(42);
     int result = VerifyPayload(signature, signatureTimestamp, response);
@@ -2198,7 +2457,9 @@ void KeyAuth::api::forgot(std::string username, std::string email)
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
     auto json = response_decoder.parse(response);
     load_response_data(json);
 }
@@ -2212,7 +2473,9 @@ void KeyAuth::api::logout() {
         XorStr("&sessionid=") + curl_escape(nullptr, sessionid) +
         XorStr("&name=") + curl_escape(nullptr, get_name()) +
         XorStr("&ownerid=") + curl_escape(nullptr, get_ownerid());
+    ScopeWipe wipe_request_data(data);
     auto response = req(data, get_url());
+    ScopeWipe wipe_response_body(response);
     auto json = response_decoder.parse(response);
     if (json[(XorStr("success"))]) {
 
@@ -2230,6 +2493,8 @@ void KeyAuth::api::logout() {
         //clear enckey
         secure_zero(enckey);
         reset_auth_runtime();
+        initialized = false;
+        secure_zero(initialized_context_);
     }
 
     load_response_data(json);
@@ -2380,13 +2645,13 @@ void KeyAuth::api::reset_lockout(lockout_state& state)
     state.locked_until = std::chrono::steady_clock::time_point{};
 }
 
-int VerifyPayload(std::string signature, std::string timestamp, std::string body)
+int VerifyPayload(const std::string& signature, const std::string& timestamp, const std::string& body, long long received_at)
 {
     integrity_check();
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     const auto result = keyauth_detail::verify_payload(signature, timestamp, body,
-                                                       get_public_key_hex(), now);
+                                                       get_public_key_hex(), received_at > 0 ? received_at : now);
     if (result == keyauth_detail::PayloadResult::timestamp_skew) {
         throw KeyAuth::request_error("Signed response timestamp is outside the 120 second window. Synchronize the system clock and retry.");
     }
@@ -2397,19 +2662,6 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     return (42 ^ 0xA5A5) & 0xFFFF;
 }
 
-// credits https://stackoverflow.com/a/3790661
-static std::string hexDecode(const std::string& hex)
-{
-    int len = hex.length();
-    std::string newString;
-    for (int i = 0; i < len; i += 2)
-    {
-        std::string byte = hex.substr(i, 2);
-        char chr = (char)(int)strtol(byte.c_str(), NULL, 16);
-        newString.push_back(chr);
-    }
-    return newString;
-}
 // credits https://stackoverflow.com/a/43002794
 std::string get_str_between_two_str(const std::string& s,
     const std::string& start_delim,
@@ -2434,7 +2686,13 @@ std::string curl_escape(CURL* curl, const std::string& input)
     if (input.size() > INT_MAX) throw KeyAuth::request_error("API field is too large.");
     char* encoded = curl_easy_escape(curl, input.data(), static_cast<int>(input.size()));
     if (!encoded) throw KeyAuth::request_error("Could not encode API field.");
-    std::unique_ptr<char, decltype(&curl_free)> owner(encoded, curl_free);
+    const auto release_encoded = [](char* value) noexcept {
+        if (value) {
+            SecureZeroMemory(value, std::strlen(value));
+            curl_free(value);
+        }
+    };
+    std::unique_ptr<char, decltype(release_encoded)> owner(encoded, release_encoded);
     return std::string(encoded);
 }
 
@@ -3118,6 +3376,7 @@ KeyAuth::api::~api()
     secure_zero(sessionid);
     secure_zero(enckey);
     secure_zero(magic_link_email_);
+    secure_zero(initialized_context_);
     secure_zero(name_enc_);
     secure_zero(ownerid_enc_);
     secure_zero(version_enc_);
@@ -3163,8 +3422,16 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
     integrity_check();
     // usage: keep this in req() so every api call is protected -nigel
     if (LoggedIn.load() && !request_bypasses_local_auth(data) && !local_auth_valid(false)) {
-        reset_auth_runtime();
-        throw request_error(XorStr("local auth gate failed."));
+        if (!local_auth_valid(false, false)) {
+            reset_auth_runtime();
+            throw request_error(XorStr("local auth gate failed."));
+        }
+        check();
+        if (!response.success || !local_auth_valid(false))
+            throw request_error("Session validation failed before the requested operation.");
+        response.success = false;
+        signature.clear();
+        signatureTimestamp.clear();
     }
     keyauth_detail::ApiEndpoint endpoint;
     try {
@@ -3173,8 +3440,16 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
         throw request_error(e.what());
     }
     const std::string host = endpoint.host;
-    if (!authenticated_host_.empty() && host != authenticated_host_)
-        throw request_error("API hostname changed after initialization.");
+    const std::string operation = data.substr(0, data.find('&')).substr(5);
+    if (!initialization_context_valid())
+        throw request_error("Application configuration changed after initialization. Create a new API instance.");
+    const auto configured = keyauth_detail::parse_api_endpoint(get_url());
+    if (!keyauth_detail::request_endpoint_matches(configured.url, endpoint.url, operation))
+        throw request_error("Request endpoint does not match the configured application.");
+    const std::string requested_owner = get_ownerid();
+    const std::string requested_name = get_name();
+    std::string requested_session = sessionid;
+    ScopeWipe wipe_requested_session(requested_session);
     if (hosts_override_present(host))
         throw request_error("Windows hosts file overrides the configured API hostname.");
     if (!allowed_hosts.empty() && std::none_of(allowed_hosts.begin(), allowed_hosts.end(),
@@ -3187,11 +3462,11 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
     }
 
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl_guard(curl, curl_easy_cleanup);
-    const std::string operation = data.substr(0, data.find('&')).substr(5);
     const bool is_file_request = operation == "file";
     const bool query_request = is_file_request || keyauth_detail::email_request_uses_get(operation);
     keyauth_detail::ResponseBuffer response_buffer{{}, is_file_request ? max_download_response_bytes : max_api_response_bytes};
     auto& to_return = response_buffer.body;
+    ScopeWipe wipe_response_buffer(to_return);
     SignatureHeaders sig_headers;
     std::string request_url = endpoint.url;
     ScopeWipe url_wipe(request_url);
@@ -3219,8 +3494,10 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
         throw request_error("Could not apply the required API transport policy.");
     if (curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS) != CURLE_OK)
         throw request_error("Could not apply the required API transport policy.");
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+    if (curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 60L) != CURLE_OK ||
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, is_file_request ? 0L : 120L) != CURLE_OK ||
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L) != CURLE_OK)
+        throw request_error("Could not apply the required API connection settings.");
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
 #if LIBCURL_VERSION_NUM >= 0x072200
@@ -3330,7 +3607,7 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
     if (sig_ok) {
         int verify_result;
         try {
-            verify_result = VerifyPayload(sig_hex, ts, to_return);
+            verify_result = VerifyPayload(sig_hex, ts, to_return, is_file_request ? sig_headers.timestamp_received_at : 0);
         } catch (...) {
             curl_guard.reset();
             throw;
@@ -3358,7 +3635,8 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
             curl_guard.reset();
             throw request_error(XorStr("public key decode failed in request guard."));
         }
-        const std::string signed_message_guard = ts + to_return;
+        std::string signed_message_guard = ts + to_return;
+        ScopeWipe wipe_signed_message(signed_message_guard);
         if (crypto_sign_ed25519_verify_detached(sig_guard,
             reinterpret_cast<const unsigned char*>(signed_message_guard.data()),
             signed_message_guard.size(),
@@ -3370,9 +3648,11 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
 
     if (sig_ok) {
         const auto envelope = nlohmann::json::parse(to_return, nullptr, false);
-        if (envelope.is_object() && envelope.contains("ownerid") &&
-            (!envelope["ownerid"].is_string() || envelope["ownerid"] != get_ownerid()))
-            throw request_error("API response owner does not match the configured application.");
+        try {
+            keyauth_detail::validate_response_context(envelope, requested_owner, requested_name, requested_session, operation);
+        } catch (const std::exception& e) {
+            throw request_error(e.what());
+        }
         if (http_status >= 400 && (!envelope.is_object() || !envelope.contains("success") ||
             !envelope["success"].is_boolean() || envelope["success"].get<bool>()))
             throw request_error("Invalid signed API error response.");
@@ -3405,7 +3685,7 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
     secure_zero(data);
     signature = sig_hex;
     signatureTimestamp = ts;
-    return to_return;
+    return std::move(to_return);
 }
 
 [[noreturn]] void error(std::string message) {
@@ -3634,6 +3914,8 @@ void KeyAuth::api::checkInit() {
     if (!initialized) {
         error(XorStr("You need to run KeyAuthApp.init() before other API functions."));
     }
+    if (!initialization_context_valid())
+        throw request_error("Application configuration changed after initialization. Create a new API instance.");
 }
 
 void integrity_check() {

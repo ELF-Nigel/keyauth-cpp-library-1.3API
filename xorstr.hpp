@@ -17,7 +17,14 @@ namespace
 #define ALWAYS_INLINE __attribute__((always_inline))
 #endif
 
-template<typename _string_type, size_t _length>
+constexpr size_t keyauth_xor_build_key(const char* time)
+{
+    return static_cast<size_t>((time[7] - '0') + (time[6] - '0') * 10 +
+        (time[4] - '0') * 60 + (time[3] - '0') * 600 +
+        (time[1] - '0') * 3600 + (time[0] - '0') * 36000);
+}
+
+template<typename _string_type, size_t _length, size_t _key = keyauth_xor_build_key(__TIME__)>
 class _Basic_XorStr
 {
 	using value_type = typename _string_type::value_type;
@@ -39,9 +46,10 @@ public:
 
 	inline auto str() const
 	{
-		decrypt();
-
-		return _string_type(data, data + _length_minus_one);
+		_string_type result(_length_minus_one, value_type{});
+		for (size_t t = 0; t < _length_minus_one; ++t)
+			result[t] = encrypted ? crypt(data[t], t) : data[t];
+		return result;
 	}
 
 	inline operator _string_type() const
@@ -58,14 +66,7 @@ private:
 
 	}
 
-	static constexpr auto XOR_KEY = static_cast<value_type>(
-		const_atoi(__TIME__[7]) +
-		const_atoi(__TIME__[6]) * 10 +
-		const_atoi(__TIME__[4]) * 60 +
-		const_atoi(__TIME__[3]) * 600 +
-		const_atoi(__TIME__[1]) * 3600 +
-		const_atoi(__TIME__[0]) * 36000
-		);
+	static constexpr auto XOR_KEY = static_cast<value_type>(_key);
 
 	static ALWAYS_INLINE constexpr auto crypt(value_type c, size_t i)
 	{
@@ -88,70 +89,70 @@ private:
 	mutable bool encrypted;
 };
 //---------------------------------------------------------------------------
-template<size_t _length>
-using XorStrA = _Basic_XorStr<std::string, _length>;
-template<size_t _length>
-using XorStrW = _Basic_XorStr<std::wstring, _length>;
-template<size_t _length>
-using XorStrU16 = _Basic_XorStr<std::u16string, _length>;
-template<size_t _length>
-using XorStrU32 = _Basic_XorStr<std::u32string, _length>;
+template<size_t _length, size_t _key = keyauth_xor_build_key(__TIME__)>
+using XorStrA = _Basic_XorStr<std::string, _length, _key>;
+template<size_t _length, size_t _key = keyauth_xor_build_key(__TIME__)>
+using XorStrW = _Basic_XorStr<std::wstring, _length, _key>;
+template<size_t _length, size_t _key = keyauth_xor_build_key(__TIME__)>
+using XorStrU16 = _Basic_XorStr<std::u16string, _length, _key>;
+template<size_t _length, size_t _key = keyauth_xor_build_key(__TIME__)>
+using XorStrU32 = _Basic_XorStr<std::u32string, _length, _key>;
 //---------------------------------------------------------------------------
-template<typename _string_type, size_t _length, size_t _length2>
-inline auto operator==(const _Basic_XorStr<_string_type, _length>& lhs, const _Basic_XorStr<_string_type, _length2>& rhs)
+template<typename _string_type, size_t _length, size_t _key, size_t _length2, size_t _key2>
+inline auto operator==(const _Basic_XorStr<_string_type, _length, _key>& lhs, const _Basic_XorStr<_string_type, _length2, _key2>& rhs)
 {
 	static_assert(_length == _length2, "XorStr== different length");
 
 	return _length == _length2 && lhs.str() == rhs.str();
 }
 //---------------------------------------------------------------------------
-template<typename _string_type, size_t _length>
-inline auto operator==(const _string_type& lhs, const _Basic_XorStr<_string_type, _length>& rhs)
+template<typename _string_type, size_t _length, size_t _key>
+inline auto operator==(const _string_type& lhs, const _Basic_XorStr<_string_type, _length, _key>& rhs)
 {
-	return lhs.size() == _length && lhs == rhs.str();
+	return lhs.size() == _length - 1 && lhs == rhs.str();
 }
 //---------------------------------------------------------------------------
-template<typename _stream_type, typename _string_type, size_t _length>
-inline auto& operator<<(_stream_type& lhs, const _Basic_XorStr<_string_type, _length>& rhs)
+template<typename _stream_type, typename _string_type, size_t _length, size_t _key>
+inline auto& operator<<(_stream_type& lhs, const _Basic_XorStr<_string_type, _length, _key>& rhs)
 {
 	lhs << rhs.c_str();
 
 	return lhs;
 }
 //---------------------------------------------------------------------------
-template<typename _string_type, size_t _length, size_t _length2>
-inline auto operator+(const _Basic_XorStr<_string_type, _length>& lhs, const _Basic_XorStr<_string_type, _length2>& rhs)
+template<typename _string_type, size_t _length, size_t _key, size_t _length2, size_t _key2>
+inline auto operator+(const _Basic_XorStr<_string_type, _length, _key>& lhs, const _Basic_XorStr<_string_type, _length2, _key2>& rhs)
 {
 	return lhs.str() + rhs.str();
 }
 //---------------------------------------------------------------------------
-template<typename _string_type, size_t _length>
-inline auto operator+(const _string_type& lhs, const _Basic_XorStr<_string_type, _length>& rhs)
+template<typename _string_type, size_t _length, size_t _key>
+inline auto operator+(const _string_type& lhs, const _Basic_XorStr<_string_type, _length, _key>& rhs)
 {
 	return lhs + rhs.str();
 }
 //---------------------------------------------------------------------------
-template<size_t _length>
+template<size_t _length, size_t _key = keyauth_xor_build_key(__TIME__)>
 constexpr ALWAYS_INLINE auto XorStr(char const (&str)[_length])
 {
-	return XorStrA<_length>(str);
+	return XorStrA<_length, _key>(str);
 }
 //---------------------------------------------------------------------------
-template<size_t _length>
+template<size_t _length, size_t _key = keyauth_xor_build_key(__TIME__)>
 constexpr ALWAYS_INLINE auto XorStr(wchar_t const (&str)[_length])
 {
-	return XorStrW<_length>(str);
+	return XorStrW<_length, _key>(str);
 }
 //---------------------------------------------------------------------------
-template<size_t _length>
+template<size_t _length, size_t _key = keyauth_xor_build_key(__TIME__)>
 constexpr ALWAYS_INLINE auto XorStr(char16_t const (&str)[_length])
 {
-	return XorStrU16<_length>(str);
+	return XorStrU16<_length, _key>(str);
 }
 //---------------------------------------------------------------------------
-template<size_t _length>
+template<size_t _length, size_t _key = keyauth_xor_build_key(__TIME__)>
 constexpr ALWAYS_INLINE auto XorStr(char32_t const (&str)[_length])
 {
-	return XorStrU32<_length>(str);
+	return XorStrU32<_length, _key>(str);
 }
 //---------------------------------------------------------------------------
