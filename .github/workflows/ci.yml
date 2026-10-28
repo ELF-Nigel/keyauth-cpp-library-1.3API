@@ -21,6 +21,280 @@ jobs:
         run: |
           msbuild .\\library.sln /p:Configuration=Release /p:Platform=x64
 
+      - name: security regression tests
+        shell: pwsh
+        run: |
+          $installation = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $devcmd = Join-Path $installation 'Common7\Tools\VsDevCmd.bat'
+          $compilerEnvironment = & cmd.exe /c "`"$devcmd`" -arch=x64 >nul && set"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($entry in $compilerEnvironment) {
+            if ($entry -match '^([^=]+)=(.*)$') {
+              [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+            }
+          }
+          $source = Join-Path $env:RUNNER_TEMP 'security-regression.cpp'
+          @'
+          #define SODIUM_STATIC
+          #include "auth.hpp"
+          #include <iostream>
+          #include <cstdlib>
+          extern std::string curl_escape(CURL*, const std::string&);
+          extern std::string get_str_between_two_str(const std::string&, const std::string&, const std::string&);
+          namespace response_headers_test {
+
+          static void require(bool condition) {
+              if (!condition) std::abort();
+          }
+          int run() {
+              keyauth_detail::SignatureHeaders h;
+              using keyauth_detail::consume_header;
+              consume_header(h, "HTTP/1.1 200 Connection established\r\n");
+              consume_header(h, "X-Signature-Ed25519: stale\r\n");
+              consume_header(h, "HTTP/2 200\r\n");
+              require(h.signature.empty() && h.timestamp.empty());
+              consume_header(h, "X-SIGNATURE-ED25519:\tvalid \t\r\n");
+              consume_header(h, "x-signature-timestamp: 1770000000\r\n");
+              require(h.signature == "valid" && h.timestamp == "1770000000");
+              consume_header(h, "x-signature-ed25519: valid\r\n");
+              require(!h.conflicting);
+              consume_header(h, "x-signature-ed25519: other\r\n");
+              require(h.conflicting);
+              consume_header(h, "HTTP/1.1 103 Early Hints\r\n");
+              require(!h.conflicting && h.signature.empty());
+              consume_header(h, "x-signature-ed25519: interim\r\n");
+              consume_header(h, "HTTP/1.1 503 Service Unavailable\r\n");
+              require(h.signature.empty());
+              consume_header(h, "server: edge\r\n");
+              consume_header(h, "\r\n");
+              require(h.signature.empty());
+              std::cout << "Response header regression tests passed\n";
+              return 0;
+          }
+
+          }
+
+          namespace payload_verifier_test {
+
+          static void require(bool condition) { if (!condition) std::abort(); }
+          static std::string hex(const unsigned char* bytes, size_t size) {
+              std::string out(size * 2 + 1, '\0');
+              sodium_bin2hex(out.data(), out.size(), bytes, size);
+              out.pop_back();
+              return out;
+          }
+          int run() {
+              using namespace keyauth_detail;
+              require(sodium_init() >= 0);
+              unsigned char pk[crypto_sign_PUBLICKEYBYTES], sk[crypto_sign_SECRETKEYBYTES];
+              crypto_sign_keypair(pk, sk);
+              const auto key = hex(pk, sizeof(pk));
+              const std::string body("{\"success\":true}\0tail", 21);
+              auto sign = [&](const std::string& timestamp) {
+                  const std::string message = timestamp + body;
+                  unsigned char sig[crypto_sign_BYTES];
+                  crypto_sign_detached(sig, nullptr,
+                      reinterpret_cast<const unsigned char*>(message.data()), message.size(), sk);
+                  return hex(sig, sizeof(sig));
+              };
+              const std::string timestamp = "1770000000";
+              const auto signature = sign(timestamp);
+              require(verify_payload(signature, timestamp, body, key, 1770000000) == PayloadResult::valid);
+              require(verify_payload(signature, timestamp, body + "!", key, 1770000000) == PayloadResult::invalid_signature);
+              require(verify_payload(signature, timestamp, body, key, 1770000121) == PayloadResult::timestamp_skew);
+              require(verify_payload(signature, timestamp, body, key, 1769999879) == PayloadResult::timestamp_skew);
+              require(verify_payload(signature, timestamp, body, key, 1770000120) == PayloadResult::valid);
+              require(verify_payload(sign("1770000000123"), "1770000000123", body, key, 1770000000) == PayloadResult::valid);
+              require(verify_payload(signature, "1770000000x", body, key, 1770000000) == PayloadResult::timestamp_format);
+              require(verify_payload("", timestamp, body, key, 1770000000) == PayloadResult::signature_format);
+              require(verify_payload(signature, timestamp, body, "00", 1770000000) == PayloadResult::public_key_format);
+              auto damaged = signature; damaged[0] = damaged[0] == '0' ? '1' : '0';
+              require(verify_payload(damaged, timestamp, body, key, 1770000000) == PayloadResult::invalid_signature);
+              sodium_memzero(sk, sizeof(sk));
+              std::cout << "Payload signature regression tests passed\n";
+              return 0;
+          }
+
+          }
+
+          namespace file_digest_test {
+          int run() {
+              const auto path = std::filesystem::temp_directory_path() / "keyauth-checksum-test.bin";
+              { std::ofstream out(path, std::ios::binary); out << "abc"; }
+              const auto digest = keyauth_detail::file_md5(path);
+              std::filesystem::remove(path);
+              if (digest != "900150983cd24fb0d6963f7d28e17f72") return 1;
+              bool rejected = false;
+              try { keyauth_detail::file_md5(path); } catch (const std::runtime_error&) { rejected = true; }
+              if (!rejected) return 1;
+              std::cout << "File checksum regression tests passed\n";
+              return 0;
+          }
+
+          }
+
+          namespace json_errors_test {
+          int run() {
+              bool parse_error = false, type_error = false;
+              try { nlohmann::json::parse("{broken"); }
+              catch (const nlohmann::json::parse_error&) { parse_error = true; }
+              try { nlohmann::json("not a boolean").get<bool>(); }
+              catch (const nlohmann::json::type_error&) { type_error = true; }
+              if (!parse_error || !type_error) return 1;
+              if (!nlohmann::json::parse("{broken", nullptr, false).is_discarded()) return 1;
+              std::cout << "JSON error handling regression tests passed\n";
+              return 0;
+          }
+
+          }
+
+          namespace api_lifecycle_test {
+          int run() {
+              if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return 1;
+              const auto hwid = utils::get_hwid();
+              if (hwid.rfind("S-1-", 0) != 0 || utils::get_hwid() != hwid) return 1;
+              if (curl_escape(nullptr, "a&+= %") != "a%26%2B%3D%20%25") return 1;
+              if (get_str_between_two_str("?user=test&token=abc", "&token=", "") != "abc") return 1;
+              for (int i = 0; i < 10; ++i) {
+                  KeyAuth::api first("first", "1234567890", "1.0", "https://keyauth.win/api/1.3/", "");
+                  KeyAuth::api second("second", "0987654321", "1.0", "https://keyauth.win/api/1.3/", "");
+                  if (!first.require_signed_downloads) return 1;
+                  first.response.success = true;
+                  if (first.authenticated() || first.authenticated(true)) return 1;
+                  if (!keyauth_detail::auth_window_fresh(10, 10) ||
+                      !keyauth_detail::auth_window_fresh(10, 12) ||
+                      keyauth_detail::auth_window_fresh(10, 13) ||
+                      keyauth_detail::auth_window_fresh(10, 9) ||
+                      keyauth_detail::auth_window_fresh(0, 0)) return 1;
+              first.enable_secure_strings();
+                  if (!first.name.empty()) return 1;
+                  first.enable_secure_strings(false);
+                  if (first.name != "first" || second.name != "second") return 1;
+                  for (size_t length : {size_t(0), size_t(1), size_t(7), size_t(8), size_t(15), size_t(16), size_t(17), size_t(4096)}) {
+                      const std::string original(length, '\0');
+                      first.name = original;
+                      first.path = std::string(length, 'x');
+                      first.enable_secure_strings();
+                      first.enable_secure_strings();
+                      if (!first.name.empty() || !first.path.empty()) return 1;
+                      first.enable_secure_strings(false);
+                      first.enable_secure_strings(false);
+                      if (first.name != original || first.path != std::string(length, 'x')) return 1;
+                  }
+                  first.stop_ban_monitor();
+              }
+              std::cout << "API lifecycle and form encoding regression tests passed\n";
+              return 0;
+          }
+
+          }
+
+
+          namespace network_policy_test {
+          static void require(bool ok) { if (!ok) std::abort(); }
+          int run() {
+              using namespace keyauth_detail;
+              require(canonical_host("KEYAUTH.WIN.") == "keyauth.win");
+              const auto endpoint = parse_api_endpoint("HTTPS://KEYAUTH.WIN.:443/api/1.3/?check_paid=1");
+              require(endpoint.host == "keyauth.win" && endpoint.port == 443);
+              require(endpoint.url.find("keyauth.win") != std::string::npos);
+              for (const auto* input : {"http://keyauth.win/api/1.3/", "https://keyauth.win@evil.invalid/",
+                  "https://user:pass@keyauth.win/", "https://keyauth.win:444/", "https://127.0.0.1/",
+                  "https://[::1]/", "https://2130706433/", "https://keyauth.win/#fragment",
+                  "https://keyauth.win\\@evil.invalid/", "https://keyauth..win/"}) {
+                  bool rejected = false;
+                  try { parse_api_endpoint(input); } catch (const std::invalid_argument&) { rejected = true; }
+                  require(rejected);
+              }
+              require(parse_api_endpoint("https://auth.customer.example/api/1.3/").host == "auth.customer.example");
+              require(hosts_line_overrides("127.0.0.1\tKEYAUTH.WIN. alias # note", "keyauth.win"));
+              require(hosts_line_overrides("::1 alias keyauth.win", "KEYAUTH.WIN."));
+              require(hosts_line_overrides("203.0.113.10 other keyauth.win", "keyauth.win"));
+              require(!hosts_line_overrides("127.0.0.1 keyauth.win.evil.invalid", "keyauth.win"));
+              require(!hosts_line_overrides("# 127.0.0.1 keyauth.win", "keyauth.win"));
+              require(!hosts_line_overrides("127.0.0.1 other # keyauth.win", "keyauth.win"));
+              require(!hosts_line_overrides("not-an-address keyauth.win", "keyauth.win"));
+              for (const auto* ip : {"127.0.0.1", "10.0.0.1", "172.16.0.1", "172.31.255.254",
+                  "192.168.1.1", "0.0.0.0", "::", "::1", "fc00::1", "fe80::1", "ff02::1",
+                  "::ffff:127.0.0.1", "::ffff:192.168.1.1", "invalid"}) require(private_address(ip));
+              for (const auto* ip : {"1.1.1.1", "8.8.8.8", "172.32.0.1", "2606:4700:4700::1111",
+                  "::ffff:8.8.8.8"}) require(!private_address(ip));
+              require(hostname_matches("api.keyauth.win", "*.keyauth.win"));
+              require(hostname_matches("KEYAUTH.WIN.", "keyauth.win"));
+              require(!hostname_matches("keyauth.win", "*.keyauth.win"));
+              require(!hostname_matches("keyauth.win.evil.invalid", "*.keyauth.win"));
+              require(!connection_address_allowed("127.0.0.1", 443, false, true));
+              require(!connection_address_allowed("127.0.0.1", 443, false, false));
+              require(!connection_address_allowed("::1", 443, false, false));
+              require(connection_address_allowed("10.0.0.1", 443, false, false));
+              require(!connection_address_allowed("::ffff:127.0.0.1", 443, false, true));
+              require(connection_address_allowed("1.1.1.1", 443, false, true));
+              require(connection_address_allowed("8.8.8.8", 443, false, true));
+              require(connection_address_allowed("127.0.0.1", 8080, true, true));
+              require(!connection_address_allowed("1.1.1.1", 80, false, true));
+              CURL* curl = curl_easy_init();
+              require(curl != nullptr);
+              long proxy = 0;
+              require(curl_easy_getinfo(curl, CURLINFO_USED_PROXY, &proxy) == CURLE_OK);
+              curl_easy_cleanup(curl);
+              std::cout << "Hostname and connection policy regression tests passed\n";
+              return 0;
+          }
+          }
+
+          namespace email_api_test {
+          static void require(bool value) { if (!value) std::abort(); }
+          int run() {
+              using namespace keyauth_detail;
+              const auto send = email_request("emailOTPSend", "a+b@example.com", "", "", "session&x", "app", "owner", "hwid");
+              require(send.find("type=emailOTPSend&email=a%2Bb%40example.com") == 0);
+              require(send.find("sessionid=session%26x") != std::string::npos);
+              require(send.find("&hwid=") == std::string::npos);
+              const auto verify = email_request("emailOTPVerify", "a@example.com", "", "012345", "s", "app", "owner", "hwid");
+              require(verify.find("&code=012345") != std::string::npos && verify.find("&hwid=hwid") != std::string::npos);
+              const auto login = email_request("loginEmail", "a@example.com", "x&+=", "987654", "s", "app", "owner", "h");
+              require(login.find("&pass=x%26%2B%3D") != std::string::npos);
+              require(email_request("magicLinkCheck", "a@example.com", "", "", "s", "app", "owner", "h").find("type=magicLinkCheck&") == 0);
+              bool rejected = false;
+              try { email_request("emailOTPVerify", "a@example.com", "", "12xx45", "s", "app", "owner", "h"); }
+              catch (const std::invalid_argument&) { rejected = true; }
+              require(rejected);
+              require(!magic_link_approved(nlohmann::json::parse(R"({"success":true,"message":"Successfully sent magic login link to email."})")));
+              require(!magic_link_approved(nlohmann::json::parse(R"({"success":false,"message":"Pending"})")));
+              require(magic_link_approved(nlohmann::json::parse(R"({"success":true,"message":"Logged in!"})")));
+              require(!magic_link_approved(nlohmann::json::parse(R"({"success":true,"authenticated":false,"message":"Logged in!"})")));
+              validate_api_reply(nlohmann::json::parse(R"({"success":false,"message":"Invalid code"})"), "owner");
+              rejected = false;
+              try { validate_api_reply(nlohmann::json::parse(R"({"success":true,"message":"Logged in!","ownerid":"other"})"), "owner"); }
+              catch (const std::invalid_argument&) { rejected = true; }
+              require(rejected);
+              require(json_text(nlohmann::json::parse(R"({"expiry":1770000000})"), "expiry") == "1770000000");
+              ResponseBuffer buffer{{}, 4};
+              require(append_response(buffer, "test", 4));
+              require(!append_response(buffer, "!", 1) && buffer.exceeded && buffer.body == "test");
+              require(!connection_address_allowed("127.0.0.1", 8080, true, true, false));
+              std::cout << "Email flow and bounded-response regression tests passed\n";
+              return 0;
+          }
+          }
+          int main() {
+              if (email_api_test::run() != 0) return 1;
+              if (network_policy_test::run() != 0) return 1;
+              if (response_headers_test::run() != 0) return 1;
+              if (payload_verifier_test::run() != 0) return 1;
+              if (file_digest_test::run() != 0) return 1;
+              if (json_errors_test::run() != 0) return 1;
+              if (api_lifecycle_test::run() != 0) return 1;
+              return 0;
+          }
+          '@ | Set-Content -LiteralPath $source
+          $object = Join-Path $env:RUNNER_TEMP 'security-regression.obj'
+          $executable = Join-Path $env:RUNNER_TEMP 'security-regression.exe'
+          & cl.exe /nologo /std:c++17 /EHsc /MD "/I$env:GITHUB_WORKSPACE" "/I$env:GITHUB_WORKSPACE\libsodium" $source "/Fo$object" "/Fe$executable" /link "$env:GITHUB_WORKSPACE\x64\Release\library_x64.lib" "$env:GITHUB_WORKSPACE\curl\zlib.lib" user32.lib shell32.lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $executable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: collect build output
         shell: pwsh
         run: |
